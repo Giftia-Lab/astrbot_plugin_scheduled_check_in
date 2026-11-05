@@ -1717,6 +1717,15 @@ input:checked + .slider:before {
   flex: 0 0 110px;
 }
 
+/* What a task's "solve Vs PoW" switch reveals: the purpose field and its hint. */
+.pow-purpose-row {
+  margin-top: 8px;
+}
+
+.pow-purpose-row .task-pow-purpose {
+  max-width: 260px;
+}
+
 .task-body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;

@@ -2,7 +2,28 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+from core.pow import POW_FAILED_CODE, POW_NONCE_HEADER, POW_TOKEN_HEADER
+
+# A seed and the nonce vsllm.cc accepted for it, from a real check-in.
+POW_SEED = "1f1f2045e9caa1bcf142ff1a4826bc61"
+POW_NONCE = "4600"
+# What vsllm.cc answers a missing, wrong or reused proof.
+POW_REFUSED = json.dumps({"code": POW_FAILED_CODE, "message": "Security check failed.", "success": False})
+
+
+def pow_challenge(token: str = "tok-1", **data: Any) -> str:
+    """Render a ``/api/pow/challenge`` body; ``data`` overrides its fields."""
+    fields = {"enabled": True, "difficulty": 18, "seed": POW_SEED, "token": token, **data}
+    return json.dumps({"success": True, "data": fields})
+
+
+def pow_proof(call: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The proof a recorded request presented, ``(None, None)`` for none."""
+    headers = call.get("headers") or {}
+    return headers.get(POW_TOKEN_HEADER), headers.get(POW_NONCE_HEADER)
 
 
 class FakeResponse:
@@ -25,7 +46,8 @@ class FakeSession:
     """Routes requests by ``(METHOD, url)`` and records every call.
 
     A route may map to a single response or to a list consumed in order, which
-    is how "balance before and after check-in" scenarios are expressed.
+    is how "balance before and after check-in" scenarios are expressed. A route
+    that maps to an exception raises it, as an unreachable host would.
     """
 
     impersonate = "chrome131"
@@ -42,6 +64,8 @@ class FakeSession:
             response = self.routes.get(url, self.default)
         if isinstance(response, list):
             response = response.pop(0) if response else self.default
+        if isinstance(response, BaseException):
+            raise response
         return response
 
     # ------------------------------------------------------------------

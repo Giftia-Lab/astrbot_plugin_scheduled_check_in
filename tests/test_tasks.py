@@ -26,7 +26,14 @@ from core.task_schema import (
     schedule_key,
     validate_task,
 )
-from tests.fakes import FakeResponse, FakeSession
+from tests.fakes import (
+    POW_NONCE,
+    POW_REFUSED,
+    FakeResponse,
+    FakeSession,
+    pow_challenge,
+    pow_proof,
+)
 
 BASE = "https://relay.example.com"
 # A Sunday.
@@ -96,6 +103,7 @@ class TaskSchemaTests(unittest.TestCase):
         self.assertTrue(task["log_history"])
         self.assertEqual((task["interval_min"], task["interval_max"]), (60, 120))
         self.assertEqual(task["headers"], [])
+        self.assertEqual(task["pow_purpose"], "")
 
     def test_interval_bounds_are_ordered_and_clamped(self) -> None:
         task = normalize_task({"schedule": "interval", "interval_min": 90, "interval_max": 0})
@@ -175,6 +183,22 @@ class TaskStorageTests(_TempDb):
         self.db.save_sites([make_site()])
         self.assertEqual(self.raw("tasks_secrets"), "")
 
+    def test_the_pow_purpose_is_kept_in_the_plain_config(self) -> None:
+        self.db.save_sites([make_site([make_task(pow_purpose="checkin")])])
+        self.assertEqual(self.db.get_sites()[0]["tasks"][0]["pow_purpose"], "checkin")
+        self.assertEqual(json.loads(self.raw("tasks_config"))[0]["pow_purpose"], "checkin")
+
+    def test_the_vs_pow_switch_round_trips_and_defaults_off(self) -> None:
+        self.db.save_sites([make_site(vs_pow=True)])
+        self.assertIs(self.db.get_sites()[0]["vs_pow"], True)
+        self.assertEqual(self.raw("vs_pow"), "1")
+        # Only a real True turns it on; a site saved without it is off.
+        for value in (None, "true", 1):
+            self.db.save_sites([make_site(vs_pow=value)])
+            self.assertIs(self.db.get_sites()[0]["vs_pow"], False, value)
+        self.db.save_sites([make_site()])
+        self.assertIs(self.db.get_sites()[0]["vs_pow"], False)
+
     def test_a_table_from_before_tasks_is_upgraded_in_place(self) -> None:
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("DROP TABLE sites")
@@ -195,6 +219,8 @@ class TaskStorageTests(_TempDb):
         conn.close()
         db = DatabaseManager(self.db_path)
         self.assertEqual(db.get_sites()[0]["tasks"], [])
+        # Added in place too, and off for every site that existed before it.
+        self.assertIs(db.get_sites()[0]["vs_pow"], False)
         db.save_sites([make_site()])
         self.assertEqual(db.get_sites()[0]["tasks"][0]["id"], "t1")
 
@@ -291,6 +317,40 @@ class RunTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("凭据已被删除", result.message)
         self.assertEqual(session.calls, [])
+
+    async def test_a_task_solves_the_vs_pow_it_names(self) -> None:
+        challenge = f"{BASE}/api/pow/challenge?purpose=checkin"
+        task = make_task(method="POST", credential_id="c1", pow_purpose="checkin")
+        result, session = await self._run(task, {
+            ("GET", challenge): FakeResponse(200, pow_challenge("tok")),
+            ("POST", f"{BASE}/api/ping"): FakeResponse(200, '{"success":true}'),
+        }, vs_pow=True)
+        self.assertTrue(result.success, result.message)
+        # The challenge goes out with the task's credential: the token names the account.
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer sk-a")
+        self.assertEqual(pow_proof(session.calls_to("/api/ping")[0]), ("tok", POW_NONCE))
+
+    async def test_a_purpose_does_nothing_until_the_site_switch_is_on(self) -> None:
+        task = make_task(pow_purpose="checkin")
+        _result, session = await self._run(task, {("GET", f"{BASE}/api/ping"): FakeResponse(200, "ok")})
+        self.assertEqual(session.urls(), [f"{BASE}/api/ping"])
+
+    async def test_a_refused_proof_is_a_failure_despite_the_200(self) -> None:
+        for site, hint in (({}, "「求解 Vs PoW」"), ({"vs_pow": True}, "请求前求解 Vs PoW")):
+            with self.subTest(site=site):
+                result, _session = await self._run(
+                    make_task(), {("GET", f"{BASE}/api/ping"): FakeResponse(200, POW_REFUSED)}, **site
+                )
+                self.assertFalse(result.success)
+                self.assertFalse(result.expired)
+                self.assertIn(hint, result.message)
+                self.assertFalse(result.attempts[-1]["success"])
+
+    async def test_without_a_purpose_no_challenge_is_asked_for(self) -> None:
+        _result, session = await self._run(
+            make_task(), {("GET", f"{BASE}/api/ping"): FakeResponse(200, "ok")}, vs_pow=True
+        )
+        self.assertEqual(session.urls(), [f"{BASE}/api/ping"])
 
 
 # ----------------------------------------------------------------------

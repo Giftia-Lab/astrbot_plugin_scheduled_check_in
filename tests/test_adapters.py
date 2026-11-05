@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 import tests  # noqa: F401
 from core.adapters import (
@@ -16,11 +17,23 @@ from core.adapters import (
     create_adapter,
     persist_writeback,
 )
+from core.cloudflare import Resolution
 from core.http_client import RequestOptions
+from core.pow import POW_MAX_ATTEMPTS, PowChallenge, PowTimeout
 from core.site_schema import ACTION_BALANCE, ACTION_CHECKIN, NEW_API_USER_HEADER, find_header
-from tests.fakes import FakeResponse, FakeSession, carries_mldsa
+from tests.fakes import (
+    POW_NONCE,
+    POW_REFUSED,
+    FakeResponse,
+    FakeSession,
+    carries_mldsa,
+    pow_challenge,
+    pow_proof,
+)
 
 BASE = "https://relay.example.com"
+POW_URL = f"{BASE}/api/pow/challenge?purpose=checkin"
+CHECKED_IN = '{"success":true,"message":"签到成功"}'
 
 
 def self_payload(quota: float, user_id: int = 7) -> str:
@@ -290,31 +303,36 @@ class NewApiCheckInTests(unittest.IsolatedAsyncioTestCase):
         await adapter.check_in()
         self.assertIsNone(adapter.writeback.checkin_headers)
 
-    async def test_405_falls_back_to_the_other_verb(self) -> None:
+    async def test_a_rejected_post_does_not_fall_back_to_the_status_get(self) -> None:
+        """Upstream's GET /api/user/checkin is the status read: it answers
+        success:true without checking in, so a fallback to it is a false pass."""
         session = FakeSession(
             {
                 ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(500000)),
                 ("POST", f"{BASE}/api/user/checkin"): FakeResponse(405, "method not allowed"),
-                ("GET", f"{BASE}/api/user/checkin"): FakeResponse(200, '{"success":true,"message":"ok"}'),
-            }
-        )
-        result = await create_adapter(make_site(), session).check_in()
-        self.assertTrue(result.success)
-        self.assertTrue(any(c["method"] == "GET" for c in session.calls_to("/api/user/checkin")))
-
-    async def test_404_moves_on_to_the_next_candidate(self) -> None:
-        session = FakeSession(
-            {
-                ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
-                ("POST", f"{BASE}/api/user/checkin"): FakeResponse(404, "nope"),
-                ("GET", f"{BASE}/api/user/checkin"): FakeResponse(404, "nope"),
-                ("POST", f"{BASE}/api/user/pay/checkin"): FakeResponse(
-                    200, '{"success":true,"message":"ok"}'
+                ("GET", f"{BASE}/api/user/checkin"): FakeResponse(
+                    200, '{"success":true,"data":{"enabled":true}}'
                 ),
             }
         )
         result = await create_adapter(make_site(), session).check_in()
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertEqual(
+            [c["method"] for c in session.calls_to("/api/user/checkin")], ["POST"]
+        )
+
+    async def test_a_missing_endpoint_is_not_probed_elsewhere(self) -> None:
+        session = FakeSession(
+            {("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0))},
+            default=FakeResponse(404, "nope"),
+        )
+        result = await create_adapter(make_site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertIn("404", result.message)
+        self.assertEqual(
+            [c["url"] for c in session.calls if "/api/user/self" not in c["url"]],
+            [f"{BASE}/api/user/checkin"],
+        )
 
     async def test_already_signed_in_counts_as_success(self) -> None:
         session = FakeSession(
@@ -328,6 +346,20 @@ class NewApiCheckInTests(unittest.IsolatedAsyncioTestCase):
         result = await create_adapter(make_site(), session).check_in()
         self.assertTrue(result.success)
         self.assertIn("已签到", result.message)
+
+    async def test_english_already_checked_in_counts_as_success(self) -> None:
+        """What vsllm.cc answers a repeat check-in."""
+        session = FakeSession(
+            {
+                ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+                ("POST", f"{BASE}/api/user/checkin"): FakeResponse(
+                    200, '{"message":"Already checked in today","success":false}'
+                ),
+            }
+        )
+        result = await create_adapter(make_site(), session).check_in()
+        self.assertTrue(result.success)
+        self.assertIn("Already checked in today", result.message)
 
     async def test_401_marks_the_credential_expired(self) -> None:
         session = FakeSession({}, default=FakeResponse(401, '{"success":false,"message":"unauthorized"}'))
@@ -344,7 +376,7 @@ class NewApiCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.expired)
         self.assertIn("New-Api-User", result.message)
 
-    async def test_custom_path_is_the_only_candidate(self) -> None:
+    async def test_a_custom_path_replaces_the_framework_one(self) -> None:
         session = FakeSession(
             {
                 ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
@@ -864,7 +896,7 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
     """
 
     @staticmethod
-    def _routes(self_responses, checkin_status: int = 404) -> dict:
+    def _routes(self_responses) -> dict:
         return {
             ("GET", f"{BASE}/api/status"): FakeResponse(
                 200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
@@ -877,11 +909,6 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
                 200, "{}", cookies={"session": "fresh"}
             ),
             ("GET", f"{BASE}/api/user/self"): self_responses,
-            # The disabled endpoint, for both verbs the adapter may try.
-            ("POST", f"{BASE}/api/user/checkin"): FakeResponse(checkin_status, "not found"),
-            ("GET", f"{BASE}/api/user/checkin"): FakeResponse(checkin_status, "not found"),
-            ("POST", f"{BASE}/api/user/pay/checkin"): FakeResponse(checkin_status, "not found"),
-            ("GET", f"{BASE}/api/user/pay/checkin"): FakeResponse(checkin_status, "not found"),
         }
 
     @staticmethod
@@ -988,7 +1015,6 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
         result = await create_adapter(self._site(), session).check_in()
         self.assertTrue(result.success)
         self.assertEqual(session.count_to("/api/user/checkin"), 0)
-        self.assertEqual(session.count_to("/api/user/pay/checkin"), 0)
 
     async def test_the_fresh_cookie_is_used_for_the_closing_balance(self) -> None:
         """The new session must be reused rather than logging in twice."""
@@ -1301,6 +1327,226 @@ class MldsaRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tls_mldsa", adapter.credentials[0])
 
 
+class PowCheckInTests(unittest.IsolatedAsyncioTestCase):
+    """Sites with the Vs PoW switch on solve vsllm.cc's challenge before a check-in."""
+
+    @staticmethod
+    def _routes(challenge, checkin=None) -> dict:
+        return {
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+            ("GET", POW_URL): challenge,
+            ("POST", f"{BASE}/api/user/checkin"): checkin or FakeResponse(200, CHECKED_IN),
+        }
+
+    @staticmethod
+    def _proofs(session: FakeSession) -> list[tuple]:
+        """What each check-in request presented."""
+        return [pow_proof(call) for call in session.calls_to("/api/user/checkin")]
+
+    @staticmethod
+    def _site(**overrides) -> dict:
+        return make_site(vs_pow=True, **overrides)
+
+    async def test_off_by_default_the_challenge_is_never_requested(self) -> None:
+        """Explicit over implicit: a site that never said it is vsllm.cc gets nothing extra."""
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge())))
+        result = await create_adapter(make_site(), session).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertNotIn(POW_URL, session.urls())
+        self.assertEqual(self._proofs(session), [(None, None)])
+
+    async def test_off_a_refusal_points_at_the_switch(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge()), FakeResponse(200, POW_REFUSED)))
+        result = await create_adapter(make_site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("「求解 Vs PoW」", result.message)
+        self.assertEqual(session.count_to("/api/user/checkin"), 1)
+
+    async def test_the_solved_challenge_goes_with_the_check_in(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge())))
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self._proofs(session), [("tok-1", POW_NONCE)])
+        # The token names the account, so the station refuses an anonymous one.
+        challenge = next(call for call in session.calls if call["url"] == POW_URL)
+        self.assertEqual(challenge["headers"]["Authorization"], "Bearer sk-a")
+        for call in session.calls_to("/api/user/self"):
+            self.assertEqual(pow_proof(call), (None, None))
+
+    async def test_the_trace_names_the_solve_without_the_token(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge())))
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertEqual(
+            [attempt["step"] for attempt in result.attempts],
+            ["查询余额", "PoW 求解", "签到", "查询最终余额"],
+        )
+        self.assertNotIn("tok-1", json.dumps(result.attempts, ensure_ascii=False))
+
+    async def test_no_usable_challenge_lets_the_check_in_go_ahead(self) -> None:
+        """The switch is on, so a station that hands out nothing usable is worth showing."""
+        for challenge in (FakeResponse(200, '{"message":"未登录","success":false}'), ConnectionError("reset")):
+            with self.subTest(challenge=challenge):
+                session = FakeSession(self._routes(challenge))
+                result = await create_adapter(self._site(), session).check_in()
+                self.assertTrue(result.success, result.message)
+                self.assertEqual(self._proofs(session), [(None, None)])
+                self.assertIn("获取 PoW 题目", [attempt["step"] for attempt in result.attempts])
+
+    async def test_a_refused_proof_is_retried_on_a_new_challenge(self) -> None:
+        session = FakeSession(
+            self._routes(
+                [FakeResponse(200, pow_challenge("tok-1")), FakeResponse(200, pow_challenge("tok-2"))],
+                [FakeResponse(200, POW_REFUSED), FakeResponse(200, CHECKED_IN)],
+            )
+        )
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self._proofs(session), [("tok-1", POW_NONCE), ("tok-2", POW_NONCE)])
+
+    async def test_repeated_refusals_stop_without_blaming_the_credential(self) -> None:
+        session = FakeSession(
+            self._routes(FakeResponse(200, pow_challenge()), FakeResponse(200, POW_REFUSED))
+        )
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("拒绝了 PoW 解答", result.message)
+        self.assertIn("并非凭据失效", result.message)
+        self.assertEqual(session.count_to("/api/user/checkin"), POW_MAX_ATTEMPTS)
+
+    async def test_a_refusal_without_a_challenge_does_not_clear_the_credential(self) -> None:
+        """No challenge may well mean a dead session, so the run must not deny it."""
+        session = FakeSession(
+            self._routes(
+                FakeResponse(200, '{"message":"未登录","success":false}'),
+                FakeResponse(200, POW_REFUSED),
+            )
+        )
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertIn("未取到可用的题目", result.message)
+        self.assertNotIn("并非凭据失效", result.message)
+        # Sent bare once: without a challenge a resend would only be refused again.
+        self.assertEqual(session.count_to("/api/user/checkin"), 1)
+
+    async def test_a_challenge_too_hard_to_solve_never_reaches_the_check_in(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge())))
+        with mock.patch.object(PowChallenge, "solve", side_effect=PowTimeout):
+            result = await create_adapter(self._site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("难度 18", result.message)
+        self.assertEqual(session.count_to("/api/user/checkin"), 0)
+
+    async def test_a_relogin_resends_the_proof(self) -> None:
+        routes = OAuthCheckInTests._github_routes(
+            self._routes(
+                FakeResponse(200, pow_challenge()),
+                [FakeResponse(401, '{"success":false}'), FakeResponse(200, CHECKED_IN)],
+            )
+        )
+        site = self._site(
+            credentials=[
+                {
+                    "id": "gh",
+                    "type": "github_oauth",
+                    "value": "user_session=gh",
+                    "session_cookie": "session=stale",
+                }
+            ]
+        )
+        session = FakeSession(routes)
+        result = await create_adapter(site, session).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self._proofs(session), [("tok-1", POW_NONCE)] * 2)
+
+    async def test_a_browser_retry_carries_the_proof(self) -> None:
+        """vsllm.cc challenges this very path, so the proof has to reach the browser."""
+        seen = []
+
+        class Recording:
+            async def resolve(self, *, response, record=None, browser_request=None):
+                seen.append(browser_request)
+                return Resolution(response)
+
+        session = FakeSession(self._routes(FakeResponse(200, pow_challenge())))
+        await create_adapter(self._site(), session, None, Recording()).check_in()
+        request = next(item for item in seen if item.method == "POST")
+        self.assertEqual(pow_proof({"headers": request.headers}), ("tok-1", POW_NONCE))
+
+    async def test_the_login_presents_its_own_proof_for_the_state(self) -> None:
+        """vsllm.cc guards /api/oauth/state with a challenge of its own purpose."""
+        oauth_pow = f"{BASE}/api/pow/challenge?purpose=oauth"
+        routes = LoginAsCheckInTests._routes(
+            [FakeResponse(200, self_payload(0)), FakeResponse(200, self_payload(0))]
+        )
+        routes[("GET", oauth_pow)] = FakeResponse(200, pow_challenge("tok-oauth"))
+        session = FakeSession(routes)
+        result = await create_adapter(LoginAsCheckInTests._site(vs_pow=True), session).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertNotIn(POW_URL, session.urls())
+        self.assertEqual(pow_proof(session.calls_to("/api/oauth/state")[0]), ("tok-oauth", POW_NONCE))
+        # Asked for anonymously, as the state itself is.
+        challenge = next(call for call in session.calls if call["url"] == oauth_pow)
+        self.assertNotIn("Cookie", challenge["headers"])
+
+    async def test_off_a_login_never_asks_for_a_challenge(self) -> None:
+        session = FakeSession(
+            LoginAsCheckInTests._routes(
+                [FakeResponse(200, self_payload(0)), FakeResponse(200, self_payload(0))]
+            )
+        )
+        await create_adapter(LoginAsCheckInTests._site(), session).check_in()
+        self.assertFalse(any("/api/pow/challenge" in url for url in session.urls()))
+
+    async def test_a_login_refused_over_its_proof_does_not_blame_the_credential(self) -> None:
+        """The state is refused before the third-party cookie is ever sent."""
+        refused = {("POST", f"{BASE}/api/oauth/state"): FakeResponse(200, POW_REFUSED)}
+        for vs_pow in (False, True):
+            with self.subTest(vs_pow=vs_pow):
+                routes = LoginAsCheckInTests._routes([FakeResponse(200, self_payload(0))] * 2)
+                routes.update(refused)
+                routes[("GET", f"{BASE}/api/pow/challenge?purpose=oauth")] = FakeResponse(200, pow_challenge())
+                result = await create_adapter(LoginAsCheckInTests._site(vs_pow=vs_pow), FakeSession(routes)).check_in()
+                self.assertFalse(result.success)
+                self.assertFalse(result.expired)
+                self.assertIn("并非凭据失效", result.message)
+
+    async def test_a_relogin_refused_over_its_proof_does_not_blame_the_credential(self) -> None:
+        """The same through the re-login a stale session sets off."""
+        routes = OAuthCheckInTests._github_routes(
+            {
+                ("GET", f"{BASE}/api/user/self"): FakeResponse(401, '{"success":false}'),
+                ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, POW_REFUSED),
+            }
+        )
+        site = make_site(
+            credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=gh",
+                          "session_cookie": "session=stale"}],
+        )
+        result = await create_adapter(site, FakeSession(routes)).test_connection()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("「求解 Vs PoW」", result.message)
+
+    async def test_a_login_with_a_dead_cookie_still_blames_it(self) -> None:
+        routes = LoginAsCheckInTests._routes([FakeResponse(200, self_payload(0))] * 2)
+        routes[("GET", "https://github.com/login/oauth/authorize")] = FakeResponse(
+            302, "", headers={"location": "https://github.com/login"}
+        )
+        result = await create_adapter(LoginAsCheckInTests._site(vs_pow=True), FakeSession(routes)).check_in()
+        self.assertFalse(result.success)
+        self.assertTrue(result.expired)
+
+    async def test_the_balance_never_solves(self) -> None:
+        """The station asks for no proof on its balance route."""
+        session = FakeSession({("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(1500000))})
+        quota, error = await create_adapter(self._site(), session).query_balance()
+        self.assertEqual((quota, error), (3.0, ""))
+        self.assertEqual(session.urls(), [f"{BASE}/api/user/self"])
+
+
 class AdapterFactoryTests(unittest.TestCase):
     def test_new_api_types_select_the_new_api_adapter(self) -> None:
         for site_type in ("new-api", "one-api", "", None, "mystery"):
@@ -1463,6 +1709,14 @@ class CheckInMessageTests(unittest.TestCase):
 
     def test_accepts_explicit_success(self) -> None:
         for message in ("签到成功", "今日已签到", "已经签到过了", "重复签到"):
+            self.assertTrue(BaseCheckInAdapter._message_indicates_checkin(message), message)
+
+    def test_accepts_english_already_checked_in(self) -> None:
+        for message in (
+            "Already checked in today",
+            "already checked-in",
+            "You have already signed in today",
+        ):
             self.assertTrue(BaseCheckInAdapter._message_indicates_checkin(message), message)
 
     def test_rejects_explicit_failure(self) -> None:
