@@ -206,11 +206,69 @@ class TaskStorageTests(_TempDb):
         self.assertEqual(self.db.get_sites()[0]["tasks"][0]["pow_purpose"], "checkin")
         self.assertEqual(json.loads(self.raw("tasks_config"))[0]["pow_purpose"], "checkin")
 
+    def test_an_older_client_preserves_pow_settings_by_task_id(self) -> None:
+        self.db.save_sites(
+            [
+                make_site(
+                    [
+                        make_task(pow_purpose="checkin"),
+                        make_task(id="t2", pow_purpose="oauth"),
+                    ],
+                    vs_pow=True,
+                )
+            ]
+        )
+        submitted = make_site([make_task(id="t2"), make_task(), make_task(id="t3")])
+        for task in submitted["tasks"]:
+            del task["pow_purpose"]
+        self.db.save_sites([submitted])
+        stored = self.db.get_sites()[0]
+        self.assertIs(stored["vs_pow"], True)
+        self.assertEqual(
+            {task["id"]: task["pow_purpose"] for task in stored["tasks"]},
+            {"t2": "oauth", "t1": "checkin", "t3": ""},
+        )
+        self.assertNotIn("vs_pow", submitted)
+        self.assertTrue(all("pow_purpose" not in task for task in submitted["tasks"]))
+
+    def test_omitted_pow_settings_are_kept_while_locked(self) -> None:
+        self.db.save_sites(
+            [
+                make_site(
+                    [
+                        make_task(pow_purpose="checkin", body='{"secret":1}'),
+                    ],
+                    vs_pow=True,
+                )
+            ]
+        )
+        key = self.db.enable_encryption()
+        self.db.lock_encryption()
+        submitted = self.db.get_sites_for_display()
+        self.assertTrue(submitted[0]["locked"])
+        del submitted[0]["vs_pow"]
+        del submitted[0]["tasks"][0]["pow_purpose"]
+        self.db.save_sites(submitted)
+        self.db.unlock_encryption(key)
+        stored = self.db.get_sites()[0]
+        self.assertIs(stored["vs_pow"], True)
+        self.assertEqual(stored["tasks"][0]["pow_purpose"], "checkin")
+        self.assertEqual(stored["tasks"][0]["body"], '{"secret":1}')
+
+    def test_explicit_values_can_still_disable_pow(self) -> None:
+        self.db.save_sites([make_site([make_task(pow_purpose="checkin")], vs_pow=True)])
+        self.db.save_sites([make_site([make_task(pow_purpose="")], vs_pow=False)])
+        stored = self.db.get_sites()[0]
+        self.assertIs(stored["vs_pow"], False)
+        self.assertEqual(stored["tasks"][0]["pow_purpose"], "")
+
     def test_the_vs_pow_switch_round_trips_and_defaults_off(self) -> None:
+        self.db.save_sites([make_site()])
+        self.assertIs(self.db.get_sites()[0]["vs_pow"], False)
         self.db.save_sites([make_site(vs_pow=True)])
         self.assertIs(self.db.get_sites()[0]["vs_pow"], True)
         self.assertEqual(self.raw("vs_pow"), "1")
-        # Only a real True turns it on; a site saved without it is off.
+        # Only a real True turns it on; an explicit false-like value turns it off.
         for value in (None, "true", 1):
             self.db.save_sites([make_site(vs_pow=value)])
             self.assertIs(self.db.get_sites()[0]["vs_pow"], False, value)

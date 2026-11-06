@@ -367,6 +367,26 @@ class NewApiCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.expired)
 
+    async def test_negated_english_checkin_messages_are_failures(self) -> None:
+        for message in (
+            "Not already checked in",
+            "You have not already signed in today",
+        ):
+            with self.subTest(message=message):
+                session = FakeSession(
+                    {
+                        ("GET", f"{BASE}/api/user/self"): FakeResponse(
+                            200, self_payload(0)
+                        ),
+                        ("POST", f"{BASE}/api/user/checkin"): FakeResponse(
+                            200, json.dumps({"success": False, "message": message})
+                        ),
+                    }
+                )
+                result = await create_adapter(make_site(), session).check_in()
+                self.assertFalse(result.success)
+                self.assertEqual(result.message, message)
+
     async def test_a_missing_new_api_user_is_not_an_expired_credential(self) -> None:
         """What vsllm.cc answers a good token without the header, on every route."""
         session = FakeSession({}, default=FakeResponse(
@@ -1425,6 +1445,7 @@ class PowCheckInTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await create_adapter(self._site(), session).check_in()
         self.assertFalse(result.success)
+        self.assertFalse(result.expired)
         self.assertIn("未取到可用的题目", result.message)
         self.assertNotIn("并非凭据失效", result.message)
         # Sent bare once: without a challenge a resend would only be refused again.
@@ -1791,8 +1812,23 @@ class CheckInMessageTests(unittest.TestCase):
             "Already checked in today",
             "already checked-in",
             "You have already signed in today",
+            "Already checked in today. Do not repeat.",
         ):
             self.assertTrue(BaseCheckInAdapter._message_indicates_checkin(message), message)
+
+    def test_rejects_negated_english_checkin_messages(self) -> None:
+        for message in (
+            "Not already checked in",
+            "Not already checked-in today",
+            "You have not already signed in today",
+            "You haven't already checked in today",
+            "You have never already checked in",
+            "You have not been checked in; already checked in is false",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    BaseCheckInAdapter._message_indicates_checkin(message), message
+                )
 
     def test_rejects_explicit_failure(self) -> None:
         for message in ("签到失败", "未签到", "未成功", "未触发签到"):

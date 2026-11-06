@@ -290,6 +290,15 @@ class TaskEndpointTests(SiteEndpointTests):
         self.assertEqual(response["status"], "ok")
         self.assertEqual(self.db.get_sites()[0]["tasks"][0]["pow_purpose"], "checkin")
 
+    async def test_an_older_site_payload_preserves_pow_settings(self) -> None:
+        self.db.save_sites([{**self._site(pow_purpose="checkin"), "vs_pow": True}])
+        main.request.body = [self._site()]
+        response = await self.plugin.api_save_sites()
+        self.assertEqual(response["status"], "ok")
+        stored = self.db.get_sites()[0]
+        self.assertIs(stored["vs_pow"], True)
+        self.assertEqual(stored["tasks"][0]["pow_purpose"], "checkin")
+
     async def test_preview(self) -> None:
         main.request.body = {"schedule": "cron", "cron": "0 8 * * 1-5"}
         data = (await self.plugin.api_preview_task_schedule())["data"]

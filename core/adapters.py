@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -353,6 +354,12 @@ class BaseCheckInAdapter(ABC):
         """Recognize explicit check-in success messages without broad false positives."""
         normalized = message.strip().lower()
         if any(marker in normalized for marker in ("签到失败", "未签到", "未成功", "未触发签到")):
+            return False
+        if re.search(
+            r"\b(?:not|never|haven['’]t|hasn['’]t|didn['’]t)\s+"
+            r"(?:(?:already|yet|been)\s+)*(?:checked[ -]in|signed[ -]in)\b",
+            normalized,
+        ):
             return False
         # English-locale stations, e.g. vsllm.cc: "Already checked in today".
         return any(

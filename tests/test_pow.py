@@ -55,8 +55,11 @@ class SolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await PowChallenge(POW_SEED, 0, "tok").solve(), "0")
 
     async def test_gives_up_at_the_deadline(self) -> None:
-        with self.assertRaises(PowTimeout):
-            await PowChallenge(POW_SEED, 32, "tok").solve(timeout=0)
+        # Mock only the solver's clock, leaving asyncio's own clock untouched.
+        with mock.patch("core.pow.time") as clock:
+            clock.monotonic.side_effect = [100.0, 100.0]
+            with self.assertRaises(PowTimeout):
+                await PowChallenge(POW_SEED, 32, "tok").solve(timeout=0)
 
     async def test_the_loop_keeps_running_during_a_solve(self) -> None:
         """Hashed on the loop in batches, so other work is not stalled."""

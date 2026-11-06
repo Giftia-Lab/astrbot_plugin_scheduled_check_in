@@ -611,7 +611,26 @@ class DatabaseManager:
 
             checkin = normalize_action(site.get("checkin"), allow_oauth=True)
             balance = normalize_action(site.get("balance"), allow_oauth=False)
-            tasks_plain, tasks_secret = _split_tasks(site.get("tasks"))
+            # Older clients omit PoW options; only explicit values replace them.
+            vs_pow = bool(_row_value(previous, "vs_pow"))
+            if not keep_all and "vs_pow" in site:
+                vs_pow = site["vs_pow"] is True
+            tasks = site.get("tasks")
+            if isinstance(tasks, list) and previous and not keep_all:
+                stored_purposes = {
+                    task["id"]: task["pow_purpose"]
+                    for task in normalize_tasks(
+                        _load_json(_row_value(previous, "tasks_config") or "", [])
+                    )
+                }
+                merged_tasks = []
+                for index, task in enumerate(tasks):
+                    if isinstance(task, dict) and "pow_purpose" not in task:
+                        task_id = str(task.get("id") or f"task_{index + 1}").strip()
+                        task = {**task, "pow_purpose": stored_purposes.get(task_id, "")}
+                    merged_tasks.append(task)
+                tasks = merged_tasks
+            tasks_plain, tasks_secret = _split_tasks(tasks)
 
             created_at = site.get("created_at") or _row_value(previous, "created_at") or now_str
             last_success = None
@@ -657,13 +676,19 @@ class DatabaseManager:
                     self._seal_text(site.get("proxy"), previous, "proxy", keep_all),
                     self._seal_json(credentials, previous, "credentials", keep_all),
                     _dump_action_config(checkin),
-                    self._seal_json(checkin["headers"], previous, "checkin_headers", keep_all),
+                    self._seal_json(
+                        checkin["headers"], previous, "checkin_headers", keep_all
+                    ),
                     _dump_action_config(balance),
-                    self._seal_json(balance["headers"], previous, "balance_headers", keep_all),
+                    self._seal_json(
+                        balance["headers"], previous, "balance_headers", keep_all
+                    ),
                     # A locked site cannot be edited, so its stored tasks stand.
-                    (_row_value(previous, "tasks_config") or "") if keep_all else json.dumps(tasks_plain, ensure_ascii=False),
+                    (_row_value(previous, "tasks_config") or "")
+                    if keep_all
+                    else json.dumps(tasks_plain, ensure_ascii=False),
                     self._seal_json(tasks_secret, previous, "tasks_secrets", keep_all),
-                    1 if site.get("vs_pow") is True else 0,
+                    1 if vs_pow else 0,
                     1 if site.get("enabled", True) else 0,
                     site.get("last_checkin_date"),
                     site.get("last_checkin_time"),
