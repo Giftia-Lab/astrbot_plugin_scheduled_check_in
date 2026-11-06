@@ -273,6 +273,23 @@ class TaskEndpointTests(SiteEndpointTests):
         state = self.db.get_task_states()[("site_1", "t1")]
         self.assertTrue(state["next_run_at"])
 
+    async def test_an_invalid_pow_purpose_does_not_replace_saved_sites(self) -> None:
+        self.db.save_sites([self._site(pow_purpose="checkin")])
+        saved = self.db.get_sites()
+        for purpose in ("!!!", "中文", "  !!!  "):
+            with self.subTest(purpose=purpose):
+                main.request.body = [self._site(pow_purpose=purpose)]
+                response = await self.plugin.api_save_sites()
+                self.assertEqual(response["status"], "error")
+                self.assertIn("PoW", response["message"])
+                self.assertEqual(self.db.get_sites(), saved)
+
+    async def test_a_valid_pow_purpose_is_normalized_when_saved(self) -> None:
+        main.request.body = [self._site(pow_purpose=" CheckIn ")]
+        response = await self.plugin.api_save_sites()
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(self.db.get_sites()[0]["tasks"][0]["pow_purpose"], "checkin")
+
     async def test_preview(self) -> None:
         main.request.body = {"schedule": "cron", "cron": "0 8 * * 1-5"}
         data = (await self.plugin.api_preview_task_schedule())["data"]

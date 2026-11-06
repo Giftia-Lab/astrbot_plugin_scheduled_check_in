@@ -91,6 +91,17 @@ class ReadChallengeTests(unittest.TestCase):
     def test_reads_a_challenge(self) -> None:
         self.assertEqual(read_challenge(payload()), (PowChallenge(POW_SEED, 18, "tok"), ""))
 
+    def test_a_seed_at_the_documented_limit_is_accepted(self) -> None:
+        seed = "x" * 1024
+        self.assertEqual(
+            read_challenge(payload(seed=seed)), (PowChallenge(seed, 18, "tok"), "")
+        )
+
+    def test_an_oversized_seed_is_rejected(self) -> None:
+        challenge, reason = read_challenge(payload(seed="x" * 1025))
+        self.assertIsNone(challenge)
+        self.assertIn("1024", reason)
+
     def test_nothing_to_solve_when_it_is_off(self) -> None:
         for enabled in (False, None):
             self.assertEqual(read_challenge(payload(enabled=enabled)), (None, "站点未启用 PoW"))
@@ -190,6 +201,15 @@ class ObtainProofTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers, {})
         self.assertIn("难度 30", error)
         self.assertFalse(trace[0].get("success", False))
+
+    async def test_an_oversized_seed_is_never_solved(self) -> None:
+        with mock.patch.object(PowChallenge, "solve") as solve:
+            headers, error, _asked, trace = await self._obtain(
+                200, pow_challenge(seed="x" * 1025)
+            )
+        solve.assert_not_awaited()
+        self.assertEqual((headers, error), ({}, ""))
+        self.assertIn("1024", trace[0]["message"])
 
 
 class SendWithProofTests(unittest.IsolatedAsyncioTestCase):

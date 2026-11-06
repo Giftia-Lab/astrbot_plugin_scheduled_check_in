@@ -298,8 +298,8 @@ class BaseCheckInAdapter(ABC):
         # Set once a Cloudflare challenge outlasted browser handling this
         # run, so the resulting failure is not mistaken for a dead credential.
         self._cloudflare_blocked = False
-        # The same for an OAuth login refused over its proof of work, which
-        # says nothing about the credential either.
+        # Whether the latest OAuth login failed for a reason unrelated to its
+        # credential, such as a refused proof of work.
         self._login_inconclusive = False
 
     # ------------------------------------------------------------------
@@ -531,6 +531,7 @@ class BaseCheckInAdapter(ABC):
             credential.get("value"),
             provider_cookies=credential.get("provider_cookies"),
         )
+        self._login_inconclusive = not result.success and not result.blames_credential
 
         # Persist a rotated provider cookie whether or not the login succeeded:
         # the provider may have moved the session on before rejecting, and
@@ -548,8 +549,6 @@ class BaseCheckInAdapter(ABC):
                 self.writeback.provider_cookies[rotated_id] = result.provider_cookies
 
         if not result.success:
-            if not result.blames_credential:
-                self._login_inconclusive = True
             return "", result.message
         if result.user_id:
             # Authoritative for this session, whatever a header says.

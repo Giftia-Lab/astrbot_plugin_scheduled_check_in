@@ -126,6 +126,24 @@ class TaskSchemaTests(unittest.TestCase):
         # An interval schedule needs no cron expression.
         self.assertEqual(validate_task(make_task(schedule="interval", cron="")), "")
 
+    def test_an_invalid_pow_purpose_is_rejected_after_normalization(self) -> None:
+        for purpose in ("!!!", "中文", "  !!!  "):
+            with self.subTest(purpose=purpose):
+                self.assertIn("PoW", validate_task(make_task(pow_purpose=purpose)))
+
+    def test_valid_and_empty_pow_purposes_remain_usable(self) -> None:
+        for purpose, expected in (
+            (None, ""),
+            ("", ""),
+            ("   ", ""),
+            (" CheckIn ", "checkin"),
+            ("a b&c", "abc"),
+        ):
+            with self.subTest(purpose=purpose):
+                task = make_task(pow_purpose=purpose)
+                self.assertEqual(task["pow_purpose"], expected)
+                self.assertEqual(validate_task(task), "")
+
     def test_day_of_week_follows_crontab(self) -> None:
         """APScheduler counts from Monday; crontab's 0 and 7 are Sunday."""
         for expression in ("0 0 * * 0", "0 0 * * 7", "0 0 * * sun"):

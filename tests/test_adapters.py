@@ -1515,20 +1515,95 @@ class PowCheckInTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_relogin_refused_over_its_proof_does_not_blame_the_credential(self) -> None:
         """The same through the re-login a stale session sets off."""
-        routes = OAuthCheckInTests._github_routes(
-            {
-                ("GET", f"{BASE}/api/user/self"): FakeResponse(401, '{"success":false}'),
-                ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, POW_REFUSED),
-            }
-        )
-        site = make_site(
-            credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=gh",
-                          "session_cookie": "session=stale"}],
-        )
-        result = await create_adapter(site, FakeSession(routes)).test_connection()
-        self.assertFalse(result.success)
-        self.assertFalse(result.expired)
-        self.assertIn("「求解 Vs PoW」", result.message)
+        for vs_pow in (False, True):
+            with self.subTest(vs_pow=vs_pow):
+                oauth_pow = f"{BASE}/api/pow/challenge?purpose=oauth"
+                routes = OAuthCheckInTests._github_routes(
+                    {
+                        ("GET", f"{BASE}/api/user/self"): FakeResponse(
+                            401, '{"success":false}'
+                        ),
+                        ("GET", f"{BASE}/api/oauth/state"): FakeResponse(
+                            200, POW_REFUSED
+                        ),
+                        ("GET", oauth_pow): FakeResponse(
+                            200, pow_challenge("tok-oauth")
+                        ),
+                    }
+                )
+                site = make_site(
+                    vs_pow=vs_pow,
+                    credentials=[
+                        {
+                            "id": "gh",
+                            "type": "github_oauth",
+                            "value": "user_session=gh",
+                            "session_cookie": "session=stale",
+                        }
+                    ],
+                )
+                session = FakeSession(routes)
+                result = await create_adapter(site, session).test_connection()
+                self.assertFalse(result.success)
+                self.assertFalse(result.expired)
+                self.assertIn("并非凭据失效", result.message)
+                state_calls = session.calls_to("/api/oauth/state")
+                self.assertTrue(state_calls)
+                expected = ("tok-oauth", POW_NONCE) if vs_pow else (None, None)
+                self.assertTrue(
+                    all(pow_proof(call) == expected for call in state_calls)
+                )
+                self.assertEqual(
+                    session.count_to("/api/pow/challenge?purpose=oauth"),
+                    len(state_calls) if vs_pow else 0,
+                )
+
+    async def test_an_inconclusive_login_does_not_hide_a_later_expired_cookie(
+        self,
+    ) -> None:
+        """A balance login failure must not suppress the check-in's cookie error."""
+        for vs_pow in (False, True):
+            for checkin_credential in ("balance", "checkin"):
+                with self.subTest(vs_pow=vs_pow, credential=checkin_credential):
+                    refusals = POW_MAX_ATTEMPTS if vs_pow else 1
+                    states = [FakeResponse(200, POW_REFUSED)] * refusals + [
+                        FakeResponse(404, "")
+                    ]
+                    routes = OAuthCheckInTests._github_routes(
+                        {
+                            ("GET", f"{BASE}/api/oauth/state"): states,
+                            (
+                                "GET",
+                                f"{BASE}/api/pow/challenge?purpose=oauth",
+                            ): FakeResponse(200, pow_challenge()),
+                            (
+                                "GET",
+                                "https://github.com/login/oauth/authorize",
+                            ): FakeResponse(
+                                302,
+                                "",
+                                headers={"location": "https://github.com/login"},
+                            ),
+                        }
+                    )
+                    site = make_site(
+                        vs_pow=vs_pow,
+                        credentials=[
+                            {
+                                "id": name,
+                                "type": "github_oauth",
+                                "value": f"user_session={name}",
+                            }
+                            for name in ("balance", "checkin")
+                        ],
+                        balance={"credential_id": "balance"},
+                        checkin={"credential_id": checkin_credential},
+                    )
+                    session = FakeSession(routes)
+                    result = await create_adapter(site, session).check_in()
+                    self.assertFalse(result.success)
+                    self.assertTrue(result.expired, result.message)
+                    self.assertEqual(session.count_to("/login/oauth/authorize"), 1)
 
     async def test_a_login_with_a_dead_cookie_still_blames_it(self) -> None:
         routes = LoginAsCheckInTests._routes([FakeResponse(200, self_payload(0))] * 2)

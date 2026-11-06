@@ -44,6 +44,8 @@ POW_NONCE_HEADER = "X-Pow-Nonce"
 
 # Only the first 32 bits of the hash are tested, so nothing harder can exist.
 _MAX_DIFFICULTY = 32
+# Bound synchronous seed encoding and prefix hashing before the solve timer starts.
+_MAX_SEED_CHARS = 1024
 # Nonces hashed between yields to the event loop: about a millisecond's work.
 _BATCH = 1024
 
@@ -120,6 +122,8 @@ def read_challenge(payload: Any) -> tuple[PowChallenge | None, str]:
     seed, difficulty, token = data.get("seed"), data.get("difficulty"), data.get("token")
     if not (seed and token and isinstance(seed, str) and isinstance(token, str)):
         return None, ""
+    if len(seed) > _MAX_SEED_CHARS:
+        return None, f"PoW 题目 seed 超过 {_MAX_SEED_CHARS} 字符限制"
     if type(difficulty) is not int or not 0 <= difficulty <= _MAX_DIFFICULTY:
         return None, ""
     return PowChallenge(seed, difficulty, token), ""
