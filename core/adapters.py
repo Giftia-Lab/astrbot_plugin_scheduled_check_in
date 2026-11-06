@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -40,6 +42,12 @@ from .http_client import (
     normalize_impersonate,
 )
 from .oauth import OAuthLoginClient
+from .pow import (
+    POW_PURPOSE_CHECKIN,
+    is_refusal,
+    refusal_message,
+    send_with_proof,
+)
 from .site_schema import (
     ACTION_BALANCE,
     ACTION_CHECKIN,
@@ -86,8 +94,8 @@ _RAW_QUOTA_KEYS = ("quota", "remain_quota", "remaining_quota")
 # Balance fields already expressed in currency.
 _CURRENCY_KEYS = ("balance", "money", "credit", "amount")
 
-# Check-in endpoints New-API style stations are known to expose.
-_NEW_API_CHECKIN_PATHS = ("/api/user/checkin", "/api/user/pay/checkin")
+# The one check-in route upstream New-API registers (POST; its GET is status).
+_NEW_API_CHECKIN_PATH = "/api/user/checkin"
 _NEW_API_SELF_PATH = "/api/user/self"
 
 
@@ -198,6 +206,10 @@ class _TextResponse:
     # was tried against it.
     cloudflare: bool = False
     cloudflare_detail: str = ""
+    # Why the request was refused over its proof of work, or why none could be
+    # solved (it then never went out): set by _request_with_pow, and by
+    # _request_action when a re-login failed on its own proof of work.
+    pow_failure: str = ""
 
     @property
     def new_api_user_refused(self) -> bool:
@@ -208,6 +220,11 @@ class _TextResponse:
         which says nothing about whether the token or cookie is still good.
         """
         return self.status in (401, 403) and NEW_API_USER_HEADER in self.text.lower()
+
+    @cached_property
+    def pow_refused(self) -> bool:
+        """A refused proof of work, which says nothing about the credential."""
+        return is_refusal(self.text)
 
 
 @dataclass
@@ -264,6 +281,9 @@ class BaseCheckInAdapter(ABC):
         # The proxy is site-wide on purpose: it also covers the third-party
         # OAuth domains, which are often the ones that need it most.
         self.proxy: str | None = str(site_config.get("proxy") or "").strip() or None
+        # Off by default: no request touches /api/pow/challenge unless the user
+        # said the site is vsllm.cc or uses its proof of work (core/pow.py).
+        self.vs_pow: bool = site_config.get("vs_pow") is True
         self.writeback = SiteWriteback()
         self._acw_solver = AcwScV2SolverCache(acw_cache_file)
         self._challenge_cookies: dict[str, str] = {}
@@ -279,6 +299,9 @@ class BaseCheckInAdapter(ABC):
         # Set once a Cloudflare challenge outlasted browser handling this
         # run, so the resulting failure is not mistaken for a dead credential.
         self._cloudflare_blocked = False
+        # Whether the latest OAuth login failed for a reason unrelated to its
+        # credential, such as a refused proof of work.
+        self._login_inconclusive = False
 
     # ------------------------------------------------------------------
     # Request tracing
@@ -329,10 +352,23 @@ class BaseCheckInAdapter(ABC):
     @staticmethod
     def _message_indicates_checkin(message: str) -> bool:
         """Recognize explicit check-in success messages without broad false positives."""
-        normalized = message.strip()
+        normalized = message.strip().lower()
         if any(marker in normalized for marker in ("签到失败", "未签到", "未成功", "未触发签到")):
             return False
-        return any(marker in normalized for marker in ("签到成功", "已签到", "已经签到", "重复签到"))
+        if re.search(
+            r"\b(?:not|never|haven['’]t|hasn['’]t|didn['’]t)\s+"
+            r"(?:(?:already|yet|been)\s+)*(?:checked[ -]in|signed[ -]in)\b",
+            normalized,
+        ):
+            return False
+        # English-locale stations, e.g. vsllm.cc: "Already checked in today".
+        return any(
+            marker in normalized
+            for marker in (
+                "签到成功", "已签到", "已经签到", "重复签到",
+                "already checked in", "already checked-in", "already signed in",
+            )
+        )
 
     def _record_attempt(
         self,
@@ -465,6 +501,7 @@ class BaseCheckInAdapter(ABC):
             on_attempt=self._record_attempt,
             cloudflare=self.cloudflare,
             mldsa=self.options.tls_mldsa,
+            vs_pow=self.vs_pow,
         )
 
     def _store_station_session(
@@ -501,6 +538,7 @@ class BaseCheckInAdapter(ABC):
             credential.get("value"),
             provider_cookies=credential.get("provider_cookies"),
         )
+        self._login_inconclusive = not result.success and not result.blames_credential
 
         # Persist a rotated provider cookie whether or not the login succeeded:
         # the provider may have moved the session on before rejecting, and
@@ -772,10 +810,10 @@ class BaseCheckInAdapter(ABC):
             **extra,
         )
 
-    def _record_cloudflare(
+    def _record_step(
         self, step: str, method: str, url: str, **fields: Any
     ) -> None:
-        """Trace callback in the shape the Cloudflare context calls."""
+        """Trace callback in the shape core.cloudflare and core.pow call."""
         self._record_attempt(step=step, method=method, endpoint=url, **fields)
 
     async def _send_past_cloudflare(
@@ -798,7 +836,7 @@ class BaseCheckInAdapter(ABC):
         if self.cloudflare is not None:
             resolution = await self.cloudflare.resolve(
                 response=response,
-                record=self._record_cloudflare,
+                record=self._record_step,
                 browser_request=BrowserRequest(
                     method,
                     url,
@@ -895,16 +933,22 @@ class BaseCheckInAdapter(ABC):
         action: dict[str, Any],
         step: str = "请求",
         body: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[_TextResponse, _AuthContext]:
         """Perform an action request, re-logging in once if a session expired.
 
         Every attempt is recorded in the run's trace, so a caller never has to
         remember to log; ``step`` names the phase in that trace.
 
+        Args:
+            extra_headers: Headers for this request alone, re-login included;
+                ``auth`` is left without them.
+
         Returns:
             Tuple of the response and the (possibly refreshed) auth context.
         """
-        response = await self._traced_request(method, url, auth.headers, step, body)
+        extra = extra_headers or {}
+        response = await self._traced_request(method, url, {**auth.headers, **extra}, step, body)
         # A challenge says nothing about the session, so logging in again would
         # only spend the credential on a request the firewall still blocks.
         if (
@@ -917,9 +961,12 @@ class BaseCheckInAdapter(ABC):
         logger.info("Stored OAuth session for %s expired; logging in again.", self.site_name)
         refreshed = await self._refresh_oauth(auth, action)
         if not refreshed.ok:
+            if self._login_inconclusive:
+                # Otherwise read as a dead credential by every caller.
+                response.pow_failure = refreshed.error
             return response, refreshed
         retried = await self._traced_request(
-            method, url, refreshed.headers, f"{step}（重新登录后）", body
+            method, url, {**refreshed.headers, **extra}, f"{step}（重新登录后）", body
         )
         return retried, refreshed
 
@@ -956,11 +1003,84 @@ class BaseCheckInAdapter(ABC):
             method=method,
             endpoint=url,
             status=response.status,
-            success=200 <= response.status < 300 and not is_acw_sc_v2_challenge(response.text),
+            success=(
+                200 <= response.status < 300
+                and not is_acw_sc_v2_challenge(response.text)
+                # Refused with a 200, which is no success.
+                and not response.pow_refused
+            ),
             message=message,
             response_text=response.text,
         )
         return response
+
+    # ------------------------------------------------------------------
+    # Proof of work
+    # ------------------------------------------------------------------
+    async def _request_with_pow(
+        self,
+        method: str,
+        url: str,
+        auth: _AuthContext,
+        action: dict[str, Any],
+        purpose: str,
+        step: str,
+        body: str | None = None,
+        in_task: bool = False,
+    ) -> tuple[_TextResponse, _AuthContext]:
+        """Send an action request, with a solved Vs PoW when the site asks for one.
+
+        Only with the site's Vs PoW switch on and a purpose named; otherwise
+        this is a plain action request and the challenge endpoint is never
+        contacted. The challenge is asked for with the request's own
+        credential: a token names the account it was issued to, and the
+        station refuses some purposes to anyone not logged in.
+
+        Args:
+            in_task: The purpose is a scheduled task's own setting, so a
+                refusal also says to check it.
+
+        Returns:
+            Tuple of the response and the auth context. A refusal, or a
+            challenge too hard to solve, is explained in ``pow_failure``; for
+            the latter the request never went out and the response is empty.
+        """
+        if not (self.vs_pow and purpose):
+            response, auth = await self._request_action(method, url, auth, action, step=step, body=body)
+            if response.pow_refused:
+                response.pow_failure = self._pow_failure(purpose, {}, in_task)
+            return response, auth
+
+        async def fetch(challenge: str) -> tuple[int, str]:
+            got = await self._request_text("GET", challenge, auth.headers)
+            return got.status, got.text
+
+        async def send(proof: dict[str, str]) -> _TextResponse:
+            nonlocal auth
+            sent, auth = await self._request_action(
+                method, url, auth, action, step=step, body=body, extra_headers=proof
+            )
+            return sent
+
+        response, proof, error = await send_with_proof(
+            self.base_url, purpose, fetch, self._record_step, send,
+            # A failed re-login ends the run; another challenge would not help.
+            refused=lambda sent: auth.ok and sent.pow_refused,
+        )
+        if error:
+            return _TextResponse(status=0, text="", pow_failure=error), auth
+        if response.pow_refused:
+            response.pow_failure = self._pow_failure(purpose, proof, in_task)
+        return response, auth
+
+    def _pow_failure(self, purpose: str, proof: dict[str, str], in_task: bool) -> str:
+        """Why a request was refused over its proof of work, and what to change."""
+        if self.vs_pow and not purpose:
+            return "站点要求 Vs PoW，并非凭据失效：请在任务中开启「请求前求解 Vs PoW」并填写该接口的题目用途"
+        message = refusal_message(self.vs_pow, bool(proof))
+        if proof and in_task:
+            message += f"；请确认题目用途「{purpose}」与该接口一致"
+        return message
 
     @staticmethod
     def _waf_message(response: _TextResponse) -> str:
@@ -1005,6 +1125,8 @@ class BaseCheckInAdapter(ABC):
 
     def _parse_json(self, response: _TextResponse) -> tuple[dict[str, Any] | None, str]:
         """Parse a JSON body, returning a human-readable error instead of raising."""
+        if response.pow_failure:
+            return None, response.pow_failure
         if is_acw_sc_v2_challenge(response.text):
             return None, self._waf_message(response)
         if response.cloudflare:
@@ -1241,8 +1363,9 @@ class BaseCheckInAdapter(ABC):
 
         It goes out like the site's own requests — proxy, fingerprint,
         Cloudflare handling, acw_sc__v2 solving — with the credential the task
-        names, if any, and its headers applied last. Any 2xx answer counts as
-        success; the response is kept in the trace either way.
+        names, if any, and its headers applied last. A task that names a Vs PoW
+        purpose solves that challenge first. Any 2xx answer counts as success,
+        bar a refused proof; the response is kept in the trace either way.
 
         Args:
             task: A normalized task (see core/task_schema.py).
@@ -1280,10 +1403,15 @@ class BaseCheckInAdapter(ABC):
             headers.update(headers_to_mapping(action["headers"]))
             auth = _AuthContext(headers=headers)
 
+        purpose = str(task.get("pow_purpose") or "")
         try:
-            response, _auth = await self._request_action(method, url, auth, action, step=step, body=body)
+            response, _auth = await self._request_with_pow(
+                method, url, auth, action, purpose, step, body=body, in_task=True
+            )
         except Exception as exc:
             return result(False, f"请求异常：{exc}")
+        if response.pow_failure:
+            return result(False, response.pow_failure)
 
         if is_acw_sc_v2_challenge(response.text):
             return result(False, self._waf_message(response))
@@ -1328,6 +1456,9 @@ class BaseCheckInAdapter(ABC):
         """Build a CheckInResult for this site, attaching the request trace.
 
         Args:
+            expired: Whether the credential is to blame. Overruled when this
+                run's OAuth login failed on something else, which every caller
+                would otherwise report as a dead credential.
             detail_on_success: Record the trace even though the run succeeded.
                 Used when part of the run failed anyway — a stale balance after
                 a successful check-in is otherwise unexplained.
@@ -1340,7 +1471,7 @@ class BaseCheckInAdapter(ABC):
             message=message,
             gained_quota=gained_quota,
             total_quota=total_quota,
-            expired=expired,
+            expired=expired and not self._login_inconclusive,
             error_detail=self._format_attempts(self.attempts) if include_detail else "",
             attempts=list(self.attempts),
         )
@@ -1349,72 +1480,57 @@ class BaseCheckInAdapter(ABC):
 class NewApiAdapter(BaseCheckInAdapter):
     """Adapter for New-API / One-API relay station frameworks."""
 
-    def _checkin_candidates(self) -> list[str]:
-        """Return the check-in URLs to try, in order."""
-        if str(self.checkin.get("path") or "").strip():
-            return [self._action_url(self.checkin)]
-        return [f"{self.base_url}{path}" for path in _NEW_API_CHECKIN_PATHS]
-
     async def _attempt_checkin(
         self,
         auth: _AuthContext,
-    ) -> tuple[bool, str, bool, bool]:
-        """Try the configured or framework check-in endpoints.
+    ) -> tuple[bool, str, bool]:
+        """Call the configured or framework check-in endpoint.
+
+        Upstream New-API registers only ``POST /api/user/checkin``; the ``GET``
+        on that route is the status read, which answers ``success: true``
+        without checking in. So neither another path nor the other verb is
+        tried: a station that differs sets its own path and protocol.
+
+        With the site's Vs PoW switch on, the request carries a solved
+        ``checkin`` challenge; a refused one is retried on a new challenge the
+        way the station's own client does.
 
         Returns:
-            Tuple of ``(success, message, expired, endpoint_missing)``.
+            Tuple of ``(success, message, expired)``.
         """
-        follow_framework = self.checkin.get("protocol") in (PROTOCOL_AUTO, PROTOCOL_OAUTH)
         method = self._action_method(self.checkin, "POST")
-        last_message = ""
-        missing = True
+        url = self._action_url(self.checkin, _NEW_API_CHECKIN_PATH)
+        try:
+            response, auth = await self._request_with_pow(
+                method, url, auth, self.checkin, POW_PURPOSE_CHECKIN, "签到"
+            )
+        except Exception as exc:
+            return False, f"请求异常: {exc}", False
+        if not auth.ok:
+            return False, auth.error, True
 
-        for url in self._checkin_candidates():
-            try:
-                response, auth = await self._request_action(
-                    method, url, auth, self.checkin, step="签到"
-                )
-                if not auth.ok:
-                    return False, auth.error, True, False
+        if response.pow_failure:
+            return False, response.pow_failure, False
+        if response.status == 404:
+            return False, "签到接口不存在 (404)", False
+        if response.cloudflare:
+            return False, self._cloudflare_message(response), False
+        if response.new_api_user_refused:
+            return False, self._new_api_user_message(response), False
+        if response.status in (401, 403):
+            return False, "凭据已失效 (401/403)", True
 
-                # Some deployments only expose the verb the browser uses.
-                if follow_framework and response.status in (404, 405):
-                    fallback = "GET" if method == "POST" else "POST"
-                    response, auth = await self._request_action(
-                        fallback, url, auth, self.checkin, step="签到（换用 GET/POST）"
-                    )
+        payload, error = self._parse_json(response)
+        if error:
+            return False, error, False
 
-                if response.status == 404:
-                    last_message = last_message or "签到接口不存在 (404)"
-                    continue
-                missing = False
-
-                if response.cloudflare:
-                    # The next candidate sits behind the same firewall.
-                    return False, self._cloudflare_message(response), False, False
-                if response.new_api_user_refused:
-                    return False, self._new_api_user_message(response), False, False
-                if response.status in (401, 403):
-                    return False, "凭据已失效 (401/403)", True, False
-
-                payload, error = self._parse_json(response)
-                if error:
-                    last_message = error
-                    continue
-
-                assert payload is not None
-                message = str(payload.get("message") or payload.get("msg") or "").strip()
-                if message:
-                    last_message = message
-                if payload.get("success") is True:
-                    return True, message or "签到成功", False, False
-                if self._message_indicates_checkin(message):
-                    return True, message, False, False
-            except Exception as exc:
-                last_message = f"请求异常: {exc}"
-                continue
-
-        return False, last_message, False, missing
+        assert payload is not None
+        message = str(payload.get("message") or payload.get("msg") or "").strip()
+        if payload.get("success") is True:
+            return True, message or "签到成功", False
+        if self._message_indicates_checkin(message):
+            return True, message, False
+        return False, message, False
 
     async def check_in(self) -> CheckInResult:
         """Perform check-in on a New-API / One-API station.
@@ -1448,12 +1564,12 @@ class NewApiAdapter(BaseCheckInAdapter):
             initial_quota, initial_error = await self.query_balance()
 
         if login_is_checkin:
-            # The login *is* the sign-in on these stations, so stop here. Probing
-            # the check-in endpoints afterwards only adds 404/401 noise, and the
+            # The login *is* the sign-in on these stations, so stop here. Calling
+            # the check-in endpoint afterwards only adds 404/401 noise, and the
             # station has already credited the day.
             return await self._finish_login_checkin(initial_quota, initial_error, logged_in)
 
-        success, message, expired, endpoint_missing = await self._attempt_checkin(auth)
+        success, message, expired = await self._attempt_checkin(auth)
         total_quota, balance_error = await self.query_balance(step="查询最终余额")
 
         gained = 0.0

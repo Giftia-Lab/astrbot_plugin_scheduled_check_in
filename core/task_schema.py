@@ -2,8 +2,10 @@
 
 A task belongs to a site and is sent through that site's adapter (see
 ``BaseCheckInAdapter.run_task``), so it shares the site's proxy, fingerprint,
-credentials, Cloudflare handling and acw_sc__v2 solving. This module holds what
-has no network in it: the shape of a task, its validation, and when it runs.
+credentials, Cloudflare handling and acw_sc__v2 solving. A task may also solve
+a station's proof of work first (``pow_purpose``, see core/pow.py). This module
+holds what has no network in it: the shape of a task, its validation, and when
+it runs.
 
 Two schedules are offered:
 
@@ -22,6 +24,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Any
 
+from .pow import normalize_pow_purpose
 from .site_schema import normalize_headers
 
 SCHEDULE_CRON = "cron"
@@ -49,6 +52,8 @@ PLAIN_TASK_FIELDS = (
     "url",
     "credential_id",
     "log_history",
+    # The challenge to solve first, empty for none; see core/pow.py.
+    "pow_purpose",
 )
 SECRET_TASK_FIELDS = ("headers", "body")
 
@@ -82,6 +87,7 @@ def normalize_task(raw: Any, index: int = 0) -> dict[str, Any]:
     interval_min = _to_minutes(source.get("interval_min"), DEFAULT_INTERVAL_MINUTES[0])
     interval_max = _to_minutes(source.get("interval_max"), DEFAULT_INTERVAL_MINUTES[1])
     body = source.get("body")
+    purpose = str(source.get("pow_purpose") or "").strip()
     return {
         "id": str(source.get("id") or f"task_{index + 1}").strip(),
         "name": str(source.get("name") or "").strip(),
@@ -97,6 +103,8 @@ def normalize_task(raw: Any, index: int = 0) -> dict[str, Any]:
         "headers": normalize_headers(source.get("headers")),
         "body": "" if body is None else str(body)[:MAX_BODY_CHARS],
         "log_history": source.get("log_history", True) is not False,
+        # Preserve invalid nonempty input for validation instead of disabling PoW.
+        "pow_purpose": normalize_pow_purpose(purpose) or purpose,
     }
 
 
@@ -131,6 +139,9 @@ def validate_task(task: dict[str, Any]) -> str:
         return "请填写请求 URL"
     if not (url.startswith(("http://", "https://", "/"))):
         return "URL 须以 http:// 或 https:// 开头，或以 / 开头表示站点 Base URL 下的路径"
+    purpose = str(task.get("pow_purpose") or "").strip()
+    if purpose and not normalize_pow_purpose(purpose):
+        return "PoW 题目用途无效：请至少填写一个英文字母、数字、_ 或 -"
     if task.get("schedule") == SCHEDULE_CRON:
         try:
             cron_trigger(str(task.get("cron") or ""))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import tests  # noqa: F401
 from curl_cffi.requests import Cookies
@@ -21,7 +22,16 @@ from core.oauth import (
     merge_rotated_cookies,
     parse_cookie_header,
 )
-from tests.fakes import FakeResponse, FakeSession, carries_mldsa
+from core.pow import PowChallenge, PowTimeout
+from tests.fakes import (
+    POW_NONCE,
+    POW_REFUSED,
+    FakeResponse,
+    FakeSession,
+    carries_mldsa,
+    pow_challenge,
+    pow_proof,
+)
 
 BASE = "https://relay.example.com"
 GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize"
@@ -206,6 +216,77 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(authorize["headers"]["Referer"], f"{BASE}/")
 
 
+class StatePowTests(unittest.IsolatedAsyncioTestCase):
+    """vsllm.cc answers a state request without a solved challenge with pow_failed."""
+
+    CHALLENGE = f"{BASE}/api/pow/challenge?purpose=oauth"
+
+    @staticmethod
+    def _challenge(token: str) -> FakeResponse:
+        return FakeResponse(200, pow_challenge(token))
+
+    @staticmethod
+    def _client(session: FakeSession, trace: list | None = None) -> OAuthLoginClient:
+        recorder = (lambda **kw: trace.append(kw)) if trace is not None else None
+        return OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=recorder, vs_pow=True)
+
+    async def test_off_by_default_no_challenge_is_requested(self) -> None:
+        session = FakeSession(github_routes({("GET", self.CHALLENGE): self._challenge("tok-1")}))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success, result.message)
+        self.assertNotIn(self.CHALLENGE, session.urls())
+        self.assertEqual(pow_proof(session.calls_to("/api/oauth/state")[0]), (None, None))
+
+    async def test_off_a_refusal_points_at_the_switch(self) -> None:
+        session = FakeSession(github_routes({("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, POW_REFUSED)}))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertFalse(result.success)
+        self.assertFalse(result.blames_credential)
+        self.assertIn("「求解 Vs PoW」", result.message)
+        self.assertEqual(session.count_to("/api/oauth/state"), 1)
+
+    async def test_the_state_carries_a_solved_challenge(self) -> None:
+        session = FakeSession(github_routes({("GET", self.CHALLENGE): self._challenge("tok-1")}))
+        result = await self._client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(pow_proof(session.calls_to("/api/oauth/state")[0]), ("tok-1", POW_NONCE))
+
+    async def test_a_refused_proof_is_retried_on_a_new_challenge(self) -> None:
+        session = FakeSession(github_routes({
+            ("GET", self.CHALLENGE): [self._challenge("tok-1"), self._challenge("tok-2")],
+            ("GET", f"{BASE}/api/oauth/state"): [
+                FakeResponse(200, POW_REFUSED),
+                FakeResponse(200, '{"success":true,"data":"flow-1"}', cookies={"session": "srv"}),
+            ],
+        }))
+        result = await self._client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success, result.message)
+        tokens = [pow_proof(call)[0] for call in session.calls_to("/api/oauth/state")]
+        self.assertEqual(tokens, ["tok-1", "tok-2"])
+
+    async def test_repeated_refusals_stop_the_login_without_trying_post(self) -> None:
+        trace = []
+        session = FakeSession(github_routes({
+            ("GET", self.CHALLENGE): self._challenge("tok"),
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, POW_REFUSED),
+        }))
+        result = await self._client(session, trace).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertFalse(result.success)
+        self.assertIn("拒绝了 PoW 解答", result.message)
+        self.assertEqual([c["method"] for c in session.calls_to("/api/oauth/state")], ["GET"] * 3)
+        self.assertNotIn(GITHUB_AUTHORIZE, session.urls())
+        self.assertIn("PoW 求解", [entry["step"] for entry in trace])
+
+    async def test_a_challenge_too_hard_stops_before_the_state(self) -> None:
+        session = FakeSession(github_routes({("GET", self.CHALLENGE): self._challenge("tok")}))
+        with mock.patch.object(PowChallenge, "solve", side_effect=PowTimeout):
+            result = await self._client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertFalse(result.success)
+        self.assertFalse(result.blames_credential)
+        self.assertIn("难度 18", result.message)
+        self.assertEqual(session.count_to("/api/oauth/state"), 0)
+
+
 class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_credential_type(self) -> None:
         result = await make_client(FakeSession({})).login("gitlab_oauth", "c")
@@ -283,6 +364,7 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await make_client(session).login(GITHUB_OAUTH, "user_session=stale")
         self.assertFalse(result.success)
+        self.assertTrue(result.blames_credential)
         self.assertIn("user_session", result.message)
 
     async def test_unauthorized_authorize_response(self) -> None:
@@ -1275,6 +1357,13 @@ class MldsaLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase)
         calls = await self._calls("chrome131", True)
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(carries_mldsa(call) for call in calls))
+
+    async def test_the_vs_pow_challenge_carries_it_too(self) -> None:
+        session = FakeSession(self._routes(self.REDIRECT))
+        client = OAuthLoginClient(session, BASE, "chrome131", None, mldsa=True, vs_pow=True)
+        await client.login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertEqual(len(session.calls), 5)
+        self.assertTrue(all(carries_mldsa(call) for call in session.calls))
 
     async def test_no_leg_is_altered_by_default(self) -> None:
         calls = await self._calls("chrome131", False)

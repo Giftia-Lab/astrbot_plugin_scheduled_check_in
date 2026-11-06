@@ -112,7 +112,7 @@ const MLDSA_SUPPORT_NOTES = {
 // Endpoints each framework already knows, shown as placeholder hints.
 const FRAMEWORK_DEFAULTS = {
   'new-api': {
-    checkin: '留空自动使用 /api/user/checkin 或 /api/user/pay/checkin',
+    checkin: '留空自动 POST /api/user/checkin',
     balance: '留空自动使用 /api/user/self',
     newApiUser: '跟随框架时会自动探测 new-api-user 并回写到此处'
   },
@@ -1465,6 +1465,7 @@ function newTaskDraft() {
     headers: [],
     body: '',
     log_history: true,
+    pow_purpose: '',
     state: {},
     expanded: true
   };
@@ -1503,6 +1504,17 @@ function taskHeadersKey(task) {
   return `task-${task.id}`;
 }
 
+/**
+ * The purpose to solve for, '' when the switch is off.
+ *
+ * Mirrors normalize_pow_purpose() in core/pow.py, so a purpose that reduces to
+ * nothing is caught here rather than saved as no PoW at all.
+ */
+function readPowPurpose(enabled, purpose) {
+  if (!enabled) return '';
+  return String(purpose || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+}
+
 /** Read every task card back into taskDraft, headers included. */
 function readTaskDraftFromDom() {
   document.querySelectorAll('#tasks-list .task-card').forEach(card => {
@@ -1521,6 +1533,9 @@ function readTaskDraftFromDom() {
     task.headers = getHeaderPairs(taskHeadersKey(task));
     task.body = value('.task-body').value;
     task.log_history = value('.task-log-history').checked;
+    // Editor-only: a switch turned on before its purpose is typed stays on.
+    task.powSwitch = value('.task-pow-enabled').checked;
+    task.pow_purpose = readPowPurpose(task.powSwitch, value('.task-pow-purpose').value);
     task.expanded = !card.classList.contains('collapsed');
   });
 }
@@ -1529,6 +1544,7 @@ function readTaskDraftFromDom() {
 function validateTaskDraft(task) {
   if (!task.url) return '请填写请求 URL';
   if (!/^(https?:\/\/|\/)/i.test(task.url)) return 'URL 须以 http:// 或 https:// 开头，或以 / 开头表示站点 Base URL 下的路径';
+  if (task.powSwitch && !task.pow_purpose) return '已开启 Vs PoW，请填写题目用途（如 checkin）';
   if (task.schedule === 'cron') {
     if (!task.cron) return '请填写 cron 表达式';
     if (task.cron.split(' ').length !== 5) return 'cron 表达式应有 5 个字段（分 时 日 月 星期）';
@@ -1567,7 +1583,8 @@ function readTasksForSave() {
     credential_id: task.credential_id,
     headers: task.headers,
     body: task.body,
-    log_history: task.log_history
+    log_history: task.log_history,
+    pow_purpose: task.pow_purpose
   }));
 }
 
@@ -1699,6 +1716,18 @@ function buildTaskCard(task) {
     element.className = `form-hint ${className}`.trim();
     return element;
   };
+  const checkbox = (className, text, checked) => {
+    const label = document.createElement('label');
+    label.className = 'checkbox-label';
+    const element = document.createElement('input');
+    element.type = 'checkbox';
+    element.className = className;
+    element.checked = checked;
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(element, span);
+    return { label, element };
+  };
 
   // ---------- header ----------
   const header = document.createElement('div');
@@ -1737,16 +1766,9 @@ function buildTaskCard(task) {
   const nameInput = input('task-name', 'text', task.name);
   nameInput.placeholder = '例如：保活请求';
   body.appendChild(field('任务名称', nameInput));
-  const enabledLabel = document.createElement('label');
-  enabledLabel.className = 'checkbox-label';
-  const enabledInput = document.createElement('input');
-  enabledInput.type = 'checkbox';
-  enabledInput.className = 'task-enabled';
-  enabledInput.checked = task.enabled !== false;
-  const enabledText = document.createElement('span');
-  enabledText.textContent = '启用此任务';
-  enabledLabel.append(enabledInput, enabledText);
-  body.appendChild(field('', enabledLabel));
+  const enabled = checkbox('task-enabled', '启用此任务', task.enabled !== false);
+  const enabledInput = enabled.element;
+  body.appendChild(field('', enabled.label));
 
   // ---------- schedule ----------
   const scheduleSelect = select('task-schedule', [['cron', 'Cron 表达式'], ['interval', '随机时间间隔']], task.schedule);
@@ -1860,17 +1882,24 @@ function buildTaskCard(task) {
   body.appendChild(bodyGroup);
 
   // ---------- history ----------
-  const logLabel = document.createElement('label');
-  logLabel.className = 'checkbox-label';
-  logLabel.title = '运行频繁的任务可关闭，以免挤占历史日志的保留条数；手动运行总会记录';
-  const logInput = document.createElement('input');
-  logInput.type = 'checkbox';
-  logInput.className = 'task-log-history';
-  logInput.checked = task.log_history !== false;
-  const logText = document.createElement('span');
-  logText.textContent = '每次运行写入历史日志';
-  logLabel.append(logInput, logText);
-  body.appendChild(field('', logLabel));
+  const logHistory = checkbox('task-log-history', '每次运行写入历史日志', task.log_history !== false);
+  logHistory.label.title = '运行频繁的任务可关闭，以免挤占历史日志的保留条数；手动运行总会记录';
+  body.appendChild(field('', logHistory.label));
+
+  // ---------- Vs PoW ----------
+  const pow = checkbox('task-pow-enabled', '请求前求解 Vs PoW', Boolean(task.pow_purpose) || task.powSwitch === true);
+  pow.label.title = '部分 New-API 改版站点（如 vsllm.cc）要求请求附带工作量证明';
+  const powPurposeInput = input('task-pow-purpose', 'text', task.pow_purpose);
+  powPurposeInput.placeholder = '题目用途，如 checkin';
+  powPurposeInput.spellcheck = false;
+  powPurposeInput.setAttribute('list', 'pow-purpose-options');
+  const powHint = hint();
+  powHint.textContent = '开启后，每次运行前先请求 /api/pow/challenge?purpose=用途 并随请求发送解答。'
+    + '须同时在「基本」页开启「求解 Vs PoW」；用途须与该接口在站点前端中的一致，否则会被拒绝。';
+  const powDetails = document.createElement('div');
+  powDetails.className = 'pow-purpose-row';
+  powDetails.append(powPurposeInput, powHint);
+  body.appendChild(field('', pow.label, powDetails));
 
   // ---------- state and run-now ----------
   const stateRow = document.createElement('div');
@@ -1902,6 +1931,7 @@ function buildTaskCard(task) {
     cronGroup.style.display = isCron ? '' : 'none';
     intervalGroup.style.display = isCron ? 'none' : '';
     bodyGroup.style.display = methodSelect.value === 'POST' ? '' : 'none';
+    powDetails.style.display = pow.element.checked ? '' : 'none';
     tag.className = `cred-type-tag task-tag${enabledInput.checked ? '' : ' disabled'}`;
     tag.textContent = enabledInput.checked ? methodSelect.value : '停用';
     name.textContent = nameInput.value.trim() || '未命名任务';
@@ -1909,7 +1939,7 @@ function buildTaskCard(task) {
     stateText.textContent = describeTaskState(task);
   };
   [nameInput, cronInput, minInput, maxInput, urlInput].forEach(element => element.addEventListener('input', sync));
-  [enabledInput, scheduleSelect, methodSelect].forEach(element => element.addEventListener('change', sync));
+  [enabledInput, scheduleSelect, methodSelect, pow.element].forEach(element => element.addEventListener('change', sync));
   [scheduleSelect, cronInput, minInput, maxInput].forEach(element => {
     element.addEventListener(element === scheduleSelect ? 'change' : 'input', () => scheduleTaskPreview(card, task));
   });
@@ -2003,6 +2033,7 @@ function buildSitePayloadFromForm() {
     checkin: readActionForm('checkin'),
     balance: readActionForm('balance'),
     tasks: readTasksForSave(),
+    vs_pow: document.getElementById('site-vs-pow')?.checked === true,
     enabled: document.getElementById('site-enabled')?.checked === true
   };
 }
@@ -2017,6 +2048,7 @@ function openAddSiteModal() {
   document.getElementById('site-url').value = '';
   document.getElementById('site-proxy').value = '';
   document.getElementById('site-enabled').checked = true;
+  document.getElementById('site-vs-pow').checked = false;
   credentialDraft = [];
   renderCredentials();
   taskDraft = [];
@@ -2043,6 +2075,7 @@ function openEditSiteModal(index) {
   document.getElementById('site-url').value = site.base_url || '';
   document.getElementById('site-proxy').value = site.proxy || '';
   document.getElementById('site-enabled').checked = site.enabled === true;
+  document.getElementById('site-vs-pow').checked = site.vs_pow === true;
 
   credentialDraft = (Array.isArray(site.credentials) ? site.credentials : []).map(credential => ({
     ...credential,
@@ -2073,6 +2106,7 @@ async function submitSiteForm() {
   const base_url = document.getElementById('site-url').value.trim();
   const proxy = document.getElementById('site-proxy').value.trim();
   const enabled = document.getElementById('site-enabled').checked;
+  const vs_pow = document.getElementById('site-vs-pow').checked;
 
   if (!name || !base_url) {
     showToast('请填写站点名称与 Base URL', 'warning');
@@ -2138,6 +2172,7 @@ async function submitSiteForm() {
     checkin,
     balance: readActionForm('balance'),
     tasks,
+    vs_pow,
     enabled
   };
   if (previous) {

@@ -8,7 +8,8 @@ New-API style stations expose a standard four-legged flow:
    builds also bind it to a *server-side session*, so the cookie that response
    sets has to be carried to leg 4 or the station rejects the callback with
    ``state is empty or not same``. Newer branches serve the same route over
-   ``POST``; older ones have no such route at all.
+   ``POST``; older ones have no such route at all. vsllm.cc guards it with a
+   proof of work (see core/pow.py), solved first when the site asks for it.
 3. ``GET  {authorize_url}``                is called with the user's *third
    party* session cookie (``user_session`` for Github, ``_t`` for LinuxDO) and
    redirects back with an authorization ``code``. The query string mirrors the
@@ -43,6 +44,7 @@ from curl_cffi.requests import AsyncSession
 from .browser import BrowserRequest, _cookie_specs, _in_zone, _zone, request_body
 from .cloudflare import CloudflareContext, is_cloudflare_challenge
 from .http_client import MLDSA_ADDED, mldsa_extra_fp, mldsa_support
+from .pow import POW_PURPOSE_OAUTH, is_refusal, refusal_message, send_with_proof
 from .site_schema import holds_refresh_cookie, normalize_provider_cookies
 
 logger = logging.getLogger("astrbot")
@@ -90,6 +92,12 @@ LINUXDO_OAUTH = "linuxdo_oauth"
 
 class OAuthError(RuntimeError):
     """Raised when an OAuth login cannot be completed."""
+
+    def __init__(self, message: str, *, blames_credential: bool = True) -> None:
+        super().__init__(message)
+        # False for a failure that says nothing about the user's cookie, such
+        # as a proof of work refused before the cookie was ever sent.
+        self.blames_credential = blames_credential
 
 
 @dataclass(frozen=True)
@@ -203,6 +211,8 @@ class OAuthLoginResult:
     # None means no jar update; scopes are stored separately from the legacy
     # header so same-name cookies on different SSO hosts survive a round-trip.
     provider_cookies: list[dict[str, Any]] | None = None
+    # On a failure, whether it points at the credential; see OAuthError.
+    blames_credential: bool = True
 
 
 @dataclass
@@ -510,6 +520,7 @@ class OAuthLoginClient:
         on_attempt: Callable[..., None] | None = None,
         cloudflare: CloudflareContext | None = None,
         mldsa: bool = False,
+        vs_pow: bool = False,
     ) -> None:
         """Initialize the client.
 
@@ -528,12 +539,16 @@ class OAuthLoginClient:
             mldsa: Add ML-DSA to the TLS handshake of every leg when the
                 fingerprint lacks it — what Cloudflare in front of
                 connect.linux.do looks for in a Chrome handshake.
+            vs_pow: Solve vsllm.cc's proof of work before the state request,
+                as the site's own login page does. Off, the challenge endpoint
+                is never contacted.
         """
         self.session = session
         self.base_url = base_url.rstrip("/")
         self.impersonate = impersonate
         self.proxy = proxy or None
         self.mldsa = mldsa
+        self.vs_pow = vs_pow
         self._on_attempt = on_attempt
         self._cloudflare = cloudflare
         # What the Cloudflare context tried on the latest leg, for the message
@@ -715,23 +730,20 @@ class OAuthLoginClient:
         for method in ("GET", "POST"):
             step = "获取 OAuth state"
             try:
-                if method == "GET":
-                    response = await self._request(
-                        "GET", url, params={"provider": provider.slug}
-                    )
-                else:
-                    response = await self._request(
-                        "POST",
-                        url,
-                        headers={"Content-Type": "application/json"},
-                        json_body={"provider": provider.slug, "intent": "login"},
-                    )
+                response, proof, error = await self._request_state(method, url, provider)
             except Exception as exc:
                 self._record(step, method, url, error=str(exc))
                 raise OAuthError(f"获取 OAuth state 失败: {exc}") from exc
+            if error:
+                raise OAuthError(f"获取 OAuth state 失败：{error}", blames_credential=False)
 
             status = getattr(response, "status_code", None)
             body = getattr(response, "text", "") or ""
+
+            if is_refusal(body):
+                detail = refusal_message(self.vs_pow, bool(proof))
+                self._record(step, method, url, status=status, response_text=body, error=detail)
+                raise OAuthError(f"获取 OAuth state 失败：{detail}", blames_credential=False)
 
             # A 404/405 here means the route is not registered for this verb;
             # the other verb may still work, so keep going before giving up.
@@ -780,6 +792,40 @@ class OAuthLoginClient:
         )
         logger.info("No /api/oauth/state on %s (%s); using a local state.", self.base_url, tried)
         return local_state, ""
+
+    async def _request_state(
+        self, method: str, url: str, provider: OAuthProvider
+    ) -> tuple[Any, dict[str, str], str]:
+        """Request a state, with a solved Vs PoW when the site asks for one.
+
+        Only with ``vs_pow`` on; otherwise one plain request. The challenge is
+        asked for anonymously, like the state itself.
+
+        Returns:
+            Tuple of the last response, the proof it carried, and an error when
+            a challenge could not be solved in time; the response is then None.
+        """
+        if method == "GET":
+            headers: dict[str, str] = {}
+            extra: dict[str, Any] = {"params": {"provider": provider.slug}}
+        else:
+            headers = {"Content-Type": "application/json"}
+            extra = {"json_body": {"provider": provider.slug, "intent": "login"}}
+
+        async def send(proof: dict[str, str]) -> Any:
+            return await self._request(method, url, headers={**headers, **proof}, **extra)
+
+        if not self.vs_pow:
+            return await send({}), {}, ""
+
+        async def fetch(challenge: str) -> tuple[int, str]:
+            got = await self._request("GET", challenge)
+            return getattr(got, "status_code", 0) or 0, getattr(got, "text", "") or ""
+
+        return await send_with_proof(
+            self.base_url, POW_PURPOSE_OAUTH, fetch, self._record, send,
+            refused=lambda sent: is_refusal(getattr(sent, "text", "") or ""),
+        )
 
     def _remember_provider_cookies(
         self, provider: OAuthProvider, response: Any, url: str, cookie: str
@@ -1188,6 +1234,7 @@ class OAuthLoginClient:
                 provider_cookies=self._provider_cookies
                 if self._provider_cookies_changed
                 else None,
+                blames_credential=exc.blames_credential,
             )
 
         if rotated_cookie:

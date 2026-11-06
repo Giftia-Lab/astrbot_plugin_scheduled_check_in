@@ -26,7 +26,7 @@ from core.browser import (
 from core.cloudflare import CloudflareContext
 from core.oauth import LINUXDO_OAUTH, PROVIDERS, OAuthLoginClient
 from core.storage import DatabaseManager
-from tests.fakes import FakeResponse, FakeSession
+from tests.fakes import FakeResponse, FakeSession, pow_proof
 
 
 try:
@@ -77,6 +77,7 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
         proxy_patch.start()
         self.addCleanup(proxy_patch.stop)
         self.hits: list[tuple] = []
+        self.proofs: list[tuple] = []
         app = web.Application()
         app.add_routes(
             [
@@ -154,6 +155,7 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
         blocked = self.gate(request)
         if blocked is not None:
             return blocked
+        self.proofs.append(pow_proof({"headers": request.headers}))
         if request.method != "POST":
             self.hits.append(("solve", dict(request.cookies)))
             return web.json_response({"success": False}, status=405)
@@ -364,6 +366,14 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
             ("solve", {"cf_clearance": "ok"}),
             ("checkin", {"cf_clearance": "ok", "session": "abc"}, "7", '{"a":1}'),
         ])
+
+    async def test_a_proof_of_work_reaches_only_the_real_call(self) -> None:
+        """A proof works once, so the solving navigation must not spend it."""
+        outcome = await self.solver.request(BrowserRequest(
+            "POST", f"{self.base}/api/user/checkin", {"X-Pow-Token": "tok", "X-Pow-Nonce": "4600"},
+        ), self.options)
+        self.assertEqual(outcome.response.status_code, 200)
+        self.assertEqual(self.proofs, [(None, None), ("tok", "4600")])
 
     async def test_an_interactive_challenge_has_its_checkbox_ticked(self) -> None:
         # The stand-in widget is served from the station's address rather than Cloudflare's.

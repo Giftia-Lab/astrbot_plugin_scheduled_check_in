@@ -126,6 +126,19 @@
                 <span class="slider"></span>
               </label>
             </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="site-vs-pow">求解 Vs PoW</label>
+                <label class="switch">
+                  <input type="checkbox" id="site-vs-pow" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-hint">
+                仅适用于 vsllm.cc 的工作量证明（只按其前端实现，其他站点即使有类似机制也不保证兼容）。开启后签到与 OAuth 登录前
+                自动求解，定时任务另需在任务卡片中填写题目用途，余额查询无需求解；关闭时不会请求 <code>/api/pow/challenge</code>。
+              </div>
+            </div>
           </div>
 
           <!-- Tab: 凭据 -->
@@ -231,6 +244,14 @@
               <button type="button" class="btn btn-sm btn-primary-plain" onclick="addTask()">+ 添加定时任务</button>
             </div>
             <div id="tasks-list" class="cred-list"></div>
+            <datalist id="pow-purpose-options">
+              <option value="checkin"></option>
+              <option value="oauth"></option>
+              <option value="login"></option>
+              <option value="register"></option>
+              <option value="reset_password"></option>
+              <option value="verification"></option>
+            </datalist>
           </div>
         </div>
         <div class="modal-footer">
@@ -411,6 +432,10 @@
                     </div>
                     <span id="chromium-guide-note"></span>
                   </div>
+                </div>
+                <div id="cf-browser-docker-hint" class="form-hint">
+                  <strong>Docker 部署提示：</strong>建议为 AstrBot 容器启用 <code>--init</code>（Docker Compose：<code>init: true</code>），
+                  以回收浏览器遗留子进程，避免僵尸进程累积。已有容器需保留配置、数据和浏览器运行环境后重建，单纯重启不会生效。
                 </div>
               </div>
               <div class="form-group">

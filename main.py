@@ -88,7 +88,7 @@ async def _read_json_body() -> tuple[bool, Any]:
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
     "LLM API 中转站自动签到插件，支持 Pages 可视化配置与定时广播简报",
-    "1.3.0",
+    "1.4.0",
 )
 class ScheduledCheckInPlugin(Star):
     """Star plugin managing auto sign-ins for API relay stations."""
