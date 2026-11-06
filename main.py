@@ -51,6 +51,7 @@ from .core.site_schema import (
     NEW_API_USER_HEADER,
     SITE_TYPE_NEW_API,
     normalize_site_type,
+    validate_checkin_schedule,
 )
 from .core.storage import DEFAULT_SETTINGS, SLOT_WEBAUTHN, DatabaseManager
 from .core.task_scheduler import LOG_TYPE_TASK, TaskScheduler
@@ -457,6 +458,10 @@ class ScheduledCheckInPlugin(Star):
         for site in sites:
             if site.get("locked"):
                 continue  # a locked site's stored tasks are kept, not replaced
+            checkin = site.get("checkin")
+            problem = validate_checkin_schedule(checkin.get("schedule") if isinstance(checkin, dict) else None)
+            if problem:
+                return error_response(f"站点「{site.get('name') or ''}」：{problem}")
             for task in normalize_tasks(site.get("tasks")):
                 problem = validate_task(task)
                 if problem:

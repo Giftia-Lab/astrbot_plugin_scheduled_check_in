@@ -512,8 +512,9 @@ def normalize_checkin_schedule(raw: Any) -> dict[str, str]:
     """Normalize a site's own check-in time.
 
     Every field is kept whatever the mode, so the editor can switch modes
-    without losing what was typed. A range is the same day's: one given
-    backwards is put the right way round.
+    without losing what was typed. A range given backwards is put the right
+    way round here, so a stored one can always be run; a save is refused
+    one first, see :func:`validate_checkin_schedule`.
     """
     source = raw if isinstance(raw, dict) else {}
     mode = str(source.get("mode") or "").strip().lower()
@@ -527,6 +528,28 @@ def normalize_checkin_schedule(raw: Any) -> dict[str, str]:
         "start": start,
         "end": end,
     }
+
+
+def validate_checkin_schedule(raw: Any) -> str:
+    """Why a submitted check-in time cannot be saved as given, or ``""``.
+
+    Only the fields the chosen mode uses are checked, and against what was
+    sent rather than its normalized form, which would hide the mistake.
+    """
+    if not isinstance(raw, dict):
+        return ""
+    mode = str(raw.get("mode") or "").strip().lower()
+    if mode == CHECKIN_SCHEDULE_FIXED:
+        if normalize_time_of_day(raw.get("time"), "") == "":
+            return "签到时间应为 HH:MM"
+    elif mode == CHECKIN_SCHEDULE_RANGE:
+        start = normalize_time_of_day(raw.get("start"), "")
+        end = normalize_time_of_day(raw.get("end"), "")
+        if not start or not end:
+            return "签到时间范围应为 HH:MM ~ HH:MM"
+        if time_of_day_minutes(end) < time_of_day_minutes(start):
+            return "签到时间范围的结束不能早于开始"
+    return ""
 
 
 def site_checkin_schedule(site: Any) -> dict[str, str] | None:

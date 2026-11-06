@@ -2068,13 +2068,13 @@ async function runTaskNow(taskId, button, output) {
 }
 
 /**
- * Whether runs rewrite this credential's value while the editor is open:
- * OAuth provider cookies rotate, and an OAuth login overwrites the station
- * Cookie it wrote back. Such a value is left out of a save when untouched.
+ * Whether runs may rewrite this credential's value while the editor is open:
+ * OAuth provider cookies rotate, and an OAuth login overwrites a Cookie
+ * credential with the station cookie, a hand-added one included. Such a
+ * value is left out of a save when untouched.
  */
 function rewrittenByRuns(credential) {
-  return OAUTH_TYPES.includes(credential.type)
-    || (credential.type === 'cookie' && Boolean(credential.source_credential_id));
+  return OAUTH_TYPES.includes(credential.type) || credential.type === 'cookie';
 }
 
 /** Build a site payload from the editor, for actions that run before saving. */
@@ -2258,8 +2258,9 @@ async function submitSiteForm() {
     enabled
   };
   if (previous) {
-    // Preserve state the dashboard never edits.
-    ['last_checkin_date', 'last_checkin_time', 'last_checkin_success', 'last_quota'].forEach(key => {
+    // Preserve state the dashboard never edits. updated_at tells storage
+    // which station cookies a login wrote after this editor loaded.
+    ['last_checkin_date', 'last_checkin_time', 'last_checkin_success', 'last_quota', 'updated_at'].forEach(key => {
       if (previous[key] !== undefined) siteData[key] = previous[key];
     });
   }

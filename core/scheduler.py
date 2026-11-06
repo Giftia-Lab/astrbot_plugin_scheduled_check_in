@@ -21,6 +21,10 @@ logger = logging.getLogger("astrbot")
 # Shown when a run is skipped because the configuration is still encrypted.
 LOCKED_MESSAGE = "配置已加密未解锁，请在 Web 端输入密钥后重试"
 
+# storage_metadata key prefix of the day each site last ran at its own time,
+# so a restart never runs a site twice in one day.
+_OWN_RUN_KEY = "own_checkin_day:"
+
 
 def draw_checkin_time(
     schedule: dict[str, str],
@@ -69,9 +73,12 @@ class CheckInScheduler:
         self._persistence_lock = asyncio.Lock()
         self._history_lock = asyncio.Lock()
         # Sites with their own check-in time: the schedule each next moment
-        # was drawn from, and that moment; and the day each last fired.
+        # was drawn from, and that moment; and the day each last fired, read
+        # from and written to the database.
         self._site_targets: dict[str, tuple[tuple[str, ...], datetime]] = {}
         self._site_last_run: dict[str, str] = {}
+        # One check-in of a site at a time, across scheduled and manual runs.
+        self._site_locks: dict[str, asyncio.Lock] = {}
 
     def reset_today_target_time(self) -> None:
         """Reset cached target time when settings are updated."""
@@ -198,29 +205,72 @@ class CheckInScheduler:
         self._task = asyncio.create_task(self._scheduler_loop())
         logger.info("CheckInScheduler started background loop.")
 
+    def _own_run_day(self, site_id: str) -> str:
+        """The day a site last ran at its own time, surviving restarts."""
+        if site_id not in self._site_last_run:
+            db = getattr(self.plugin, "db", None)
+            day = ""
+            if db is not None:
+                try:
+                    day = db.get_metadata(f"{_OWN_RUN_KEY}{site_id}") or ""
+                except Exception as exc:
+                    logger.warning(f"Could not read a site's last own-time run: {exc}")
+            self._site_last_run[site_id] = day
+        return self._site_last_run[site_id]
+
+    def _mark_own_run(self, site_id: str, day: str) -> None:
+        """Record that a site ran at its own time today: once a day, success or not."""
+        self._site_last_run[site_id] = day
+        db = getattr(self.plugin, "db", None)
+        if db is None:
+            return
+        try:
+            db.set_metadata(f"{_OWN_RUN_KEY}{site_id}", day)
+        except Exception as exc:
+            logger.warning(f"Could not record a site's own-time run: {exc}")
+
+    @staticmethod
+    def _succeeded_today(site: dict[str, Any], today: str) -> bool:
+        """Whether a site's stored state says it checked in successfully today."""
+        return site.get("last_checkin_date") == today and bool(site.get("last_checkin_success"))
+
     def _site_target(self, site: dict[str, Any], now: datetime) -> datetime | None:
         """When a site with its own check-in time checks in next.
 
         Drawn once and kept, like the global target, until the site fires or
-        its schedule changes. A target of an earlier day was never reached
-        and is redrawn rather than run a day late; one earlier today is still
-        run, so a busy loop delays a check-in instead of losing it.
+        its schedule changes. A site that already ran at its own time today,
+        or checked in successfully some other way, is drawn for tomorrow. A
+        target of an earlier day was never reached and is drawn again rather
+        than run a day late; one earlier today is still run, so a busy loop or
+        a locked vault delays a check-in instead of losing it. Targets are
+        dropped while automatic check-in is off (see _scheduler_loop), so
+        turning it back on does not catch up what it skipped.
 
         Returns:
-            The moment, or None for a site following the global time.
+            The moment, or None for a site that follows the global time or
+            is disabled.
         """
         site_id = self._normalize_site_id(site.get("id"))
         schedule = site_checkin_schedule(site)
-        if not site_id or schedule is None:
+        if not site_id or schedule is None or site.get("enabled") is not True:
+            if site_id:
+                self._site_targets.pop(site_id, None)
             return None
+        today = now.date()
+        done_today = (
+            self._own_run_day(site_id) == today.isoformat()
+            or self._succeeded_today(site, today.isoformat())
+        )
         key = tuple(schedule.values())
         cached = self._site_targets.get(site_id)
-        if cached is not None and cached[0] == key and cached[1].date() >= now.date():
+        if (
+            cached is not None
+            and cached[0] == key
+            and cached[1].date() >= today
+            and not (done_today and cached[1].date() == today)
+        ):
             return cached[1]
-        today = now.date()
-        target = None
-        if self._site_last_run.get(site_id) != today.isoformat():
-            target = draw_checkin_time(schedule, today, earliest=now)
+        target = None if done_today else draw_checkin_time(schedule, today, earliest=now)
         if target is None:
             target = draw_checkin_time(schedule, today + timedelta(days=1))
         self._site_targets[site_id] = (key, target)
@@ -231,7 +281,8 @@ class CheckInScheduler:
 
         Returns:
             Dict with target_time, is_tomorrow and display_text, or None when
-            the site follows the global time or automatic check-in is off.
+            the site follows the global time, is disabled, or automatic
+            check-in is off.
         """
         if not self.plugin.get_settings().get("enabled", True):
             return None
@@ -250,24 +301,27 @@ class CheckInScheduler:
     def _due_sites(self, now: datetime) -> list[str]:
         """Sites with their own check-in time that are due now.
 
-        Each fires once a day. One that already checked in successfully
-        today, by hand or otherwise, is passed over without a run.
+        Each runs at most once a day, recorded before the run so neither a
+        failure nor a restart sends a second request that day. Nothing is
+        consumed while the vault is locked, since nothing could run.
         """
+        if self._is_locked():
+            return []
         today = now.strftime("%Y-%m-%d")
         due: list[str] = []
         for site in self.plugin.get_sites():
-            if site.get("enabled") is not True:
-                continue
             target = self._site_target(site, now)
             if target is None or target > now:
                 continue
             site_id = self._normalize_site_id(site.get("id"))
-            self._site_last_run[site_id] = today
+            self._mark_own_run(site_id, today)
             self._site_targets.pop(site_id, None)
-            if site.get("last_checkin_date") == today and site.get("last_checkin_success"):
-                continue
             due.append(site_id)
         return due
+
+    def _site_lock(self, site_id: str) -> asyncio.Lock:
+        """The lock serialising every check-in of one site."""
+        return self._site_locks.setdefault(site_id, asyncio.Lock())
 
     def stop(self) -> None:
         """Stop the background scheduler task."""
@@ -339,6 +393,17 @@ class CheckInScheduler:
         scheduler-wide lock keeps those operations consistent.
         """
         checked_at = checked_at or datetime.now()
+        if site_results_to_persist:
+            await self._persist_site_states(site_results_to_persist, checked_at)
+        async with self._history_lock:
+            self._record_checkin_history(results, manual)
+
+    async def _persist_site_states(
+        self,
+        site_results_to_persist: list[CheckInResult],
+        checked_at: datetime,
+    ) -> None:
+        """Store each result as its site's latest check-in state."""
         date_str = checked_at.strftime("%Y-%m-%d")
         time_str = checked_at.strftime("%H:%M:%S")
 
@@ -390,8 +455,6 @@ class CheckInScheduler:
 
                     if sites_changed:
                         self.plugin.save_sites(latest_sites)
-        async with self._history_lock:
-            self._record_checkin_history(results, manual)
 
     async def _scheduler_loop(self) -> None:
         """Internal background loop running check-ins at configured daily time window."""
@@ -424,6 +487,9 @@ class CheckInScheduler:
                         results = await self.run_check_in_all(only=due)
                         if results:
                             await self._send_report(results)
+                else:
+                    # Nothing skipped while off is caught up once back on.
+                    self._site_targets.clear()
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -543,11 +609,9 @@ class CheckInScheduler:
 
         if not enabled_sites:
             logger.info("No enabled check-in sites configured.")
+            if only is None:
+                self._clear_manual_target(settings)
             return results
-
-        checked_at = datetime.now()
-        today_str = checked_at.strftime("%Y-%m-%d")
-        site_results_to_persist: list[CheckInResult] = []
 
         async with create_client_session(settings) as session:
             # Share browser clearance across the run while allowing each
@@ -556,51 +620,66 @@ class CheckInScheduler:
             options = RequestOptions.from_settings(settings)
             for idx, site_config in enumerate(enabled_sites):
                 site_id = self._normalize_site_id(site_config.get("id"))
-                site_name = site_config.get("name", "<unnamed>")
-                last_date = site_config.get("last_checkin_date", "")
-                last_success = site_config.get("last_checkin_success", False)
+                # One check-in of a site at a time, scheduled or manual. A run
+                # that waited reads the state the other one left, so it does
+                # not repeat a check-in that just succeeded.
+                async with self._site_lock(site_id):
+                    fresh = self._find_site_config(self.plugin.get_sites(), site_id)
+                    if fresh is not None:
+                        site_config = fresh
+                    checked_at = datetime.now()
+                    today_str = checked_at.strftime("%Y-%m-%d")
+                    site_name = site_config.get("name", "<unnamed>")
+                    last_date = site_config.get("last_checkin_date", "")
+                    last_success = site_config.get("last_checkin_success", False)
 
-                # Skip if already signed in today successfully
-                if not force and last_date == today_str and last_success:
-                    checkin_time = site_config.get("last_checkin_time", "")
-                    msg = f"今日已完成签到 ({checkin_time})" if checkin_time else "今日已完成签到"
-                    results.append(
-                        CheckInResult(
-                            site_id=site_id,
-                            site_name=site_name,
-                            success=True,
-                            message=msg,
-                            total_quota=site_config.get("last_quota", 0.0),
+                    # Skip if already signed in today successfully
+                    if not force and last_date == today_str and last_success:
+                        checkin_time = site_config.get("last_checkin_time", "")
+                        msg = f"今日已完成签到 ({checkin_time})" if checkin_time else "今日已完成签到"
+                        results.append(
+                            CheckInResult(
+                                site_id=site_id,
+                                site_name=site_name,
+                                success=True,
+                                message=msg,
+                                total_quota=site_config.get("last_quota", 0.0),
+                            )
                         )
+                        continue
+
+                    if idx > 0:
+                        await asyncio.sleep(random.uniform(1.5, 3.5))
+
+                    adapter = create_adapter(
+                        site_config,
+                        session,
+                        getattr(self.plugin, "acw_cache_file", None),
+                        cloudflare,
+                        options,
                     )
-                    continue
-
-                if idx > 0:
-                    await asyncio.sleep(random.uniform(1.5, 3.5))
-
-                adapter = create_adapter(
-                    site_config,
-                    session,
-                    getattr(self.plugin, "acw_cache_file", None),
-                    cloudflare,
-                    options,
-                )
-                result = await adapter.check_in()
-                self._persist_site_writeback(site_id, adapter)
-                results.append(result)
-                site_results_to_persist.append(result)
+                    result = await adapter.check_in()
+                    self._persist_site_writeback(site_id, adapter)
+                    results.append(result)
+                    # Stored before the lock is released, so it is the state
+                    # the next run of this site reads.
+                    await self._persist_site_states([result], checked_at)
 
         # Clear temporary manual_target_time override after check-in execution;
         # a site checking in at its own time leaves the global run's alone.
-        if only is None and settings.get("manual_target_time"):
+        if only is None:
+            self._clear_manual_target(settings)
+
+        async with self._history_lock:
+            self._record_checkin_history(results, manual)
+        return results
+
+    def _clear_manual_target(self, settings: dict[str, Any]) -> None:
+        """Drop the one-off global target time once the global run has fired."""
+        if settings.get("manual_target_time"):
             settings["manual_target_time"] = ""
             self.plugin.save_settings(settings)
             self.reset_today_target_time()
-
-        await self._persist_checkin_results(
-            results, manual, site_results_to_persist, checked_at
-        )
-        return results
 
     async def run_check_in_site(self, site_id: str, manual: bool = True) -> CheckInResult | None:
         """Force a check-in for one configured site, ignoring today's skip state.
@@ -612,7 +691,6 @@ class CheckInScheduler:
         Returns:
             The check-in result, or None if the site does not exist.
         """
-        checked_at = datetime.now()
         all_sites = self.plugin.get_sites()
         normalized_site_id = self._normalize_site_id(site_id)
         site_config = self._find_site_config(all_sites, normalized_site_id)
@@ -628,20 +706,22 @@ class CheckInScheduler:
             )
 
         settings = self.plugin.get_settings()
-        async with create_client_session(settings) as session:
-            adapter = create_adapter(
-                site_config,
-                session,
-                getattr(self.plugin, "acw_cache_file", None),
-                self._cloudflare_context(settings),
-                RequestOptions.from_settings(settings),
-            )
-            result = await adapter.check_in()
-            self._persist_site_writeback(normalized_site_id, adapter)
+        async with self._site_lock(normalized_site_id):
+            checked_at = datetime.now()
+            async with create_client_session(settings) as session:
+                adapter = create_adapter(
+                    site_config,
+                    session,
+                    getattr(self.plugin, "acw_cache_file", None),
+                    self._cloudflare_context(settings),
+                    RequestOptions.from_settings(settings),
+                )
+                result = await adapter.check_in()
+                self._persist_site_writeback(normalized_site_id, adapter)
+            await self._persist_site_states([result], checked_at)
 
-        await self._persist_checkin_results(
-            [result], manual, [result], checked_at
-        )
+        async with self._history_lock:
+            self._record_checkin_history([result], manual)
         return result
 
     def _cloudflare_context(self, settings: dict[str, Any]) -> Any:

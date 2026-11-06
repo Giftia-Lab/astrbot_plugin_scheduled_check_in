@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 import tests  # noqa: F401
 from core.adapters import SiteWriteback, create_adapter, persist_writeback
@@ -95,6 +97,41 @@ class UpsertTests(unittest.TestCase):
         self.db.upsert_station_cookie("s1", "gh", "session=one")
         shown = self.db.get_sites_for_display()[0]["credentials"][1]
         self.assertEqual(shown["value"], "session=one")
+
+    def test_a_cookie_added_while_the_editor_was_open_survives_its_save(self) -> None:
+        self.db.save_sites([site()])
+        opened = self.db.get_sites_for_display()
+        with mock.patch("core.storage.datetime") as clock:
+            clock.now.return_value = datetime(2099, 1, 1, 0, 0, 0)
+            self.db.upsert_station_cookie("s1", "gh", "session=fresh")
+        opened[0]["name"] = "Renamed"
+        self.db.save_sites(opened)
+        cookies = [item for item in self.credentials() if item["type"] == "cookie"]
+        self.assertEqual([item["value"] for item in cookies], ["session=fresh"])
+        self.assertEqual(self.db.get_sites()[0]["name"], "Renamed")
+
+    def test_a_written_back_cookie_the_user_deleted_stays_deleted(self) -> None:
+        self.db.save_sites([site()])
+        self.db.upsert_station_cookie("s1", "gh", "session=one")
+        opened = self.db.get_sites_for_display()
+        opened[0]["credentials"] = opened[0]["credentials"][:1]
+        self.db.save_sites(opened)
+        self.assertEqual([item["type"] for item in self.credentials()], ["github_oauth"])
+
+    def test_a_save_without_loaded_at_adds_nothing(self) -> None:
+        """An API caller that sends no updated_at gets its list exactly as sent."""
+        self.db.save_sites([site()])
+        self.db.upsert_station_cookie("s1", "gh", "session=one")
+        self.db.save_sites([site()])
+        self.assertEqual(len(self.credentials()), 1)
+
+    def test_an_untouched_hand_added_cookie_keeps_a_fresh_overwrite(self) -> None:
+        self.db.save_sites([site({"id": "ck", "type": "cookie", "value": "session=old"})])
+        opened = self.db.get_sites_for_display()
+        self.db.upsert_station_cookie("s1", "gh", "session=new")
+        del opened[0]["credentials"][1]["value"]  # untouched: the dashboard leaves it out
+        self.db.save_sites(opened)
+        self.assertEqual(self.credentials()[1]["value"], "session=new")
 
 
 class SelectionTests(unittest.TestCase):

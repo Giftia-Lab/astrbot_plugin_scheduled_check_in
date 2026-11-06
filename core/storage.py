@@ -612,6 +612,7 @@ class DatabaseManager:
 
             credentials = normalize_credentials(site.get("credentials"))
             credentials = self._carry_oauth_sessions(credentials, previous)
+            credentials = self._carry_station_cookies(credentials, previous, site.get("updated_at"))
 
             raw_checkin = site.get("checkin")
             if (
@@ -775,6 +776,39 @@ class DatabaseManager:
             )
         return credentials
 
+    def _carry_station_cookies(
+        self,
+        credentials: list[dict[str, Any]],
+        previous: sqlite3.Row | dict[str, Any],
+        loaded_at: Any,
+    ) -> list[dict[str, Any]]:
+        """Keep a station Cookie an OAuth login wrote after the editor loaded.
+
+        A save replaces the whole credential list with the editor's, so a
+        Cookie credential a login added while the editor was open would be
+        dropped as if the user had deleted it. ``loaded_at`` is the site's
+        ``updated_at`` as the editor read it: a written-back Cookie missing
+        from the list but written after that is re-added, as long as the
+        login it came from is still configured. One written before it was
+        on the editor's screen, so its absence is a deletion and stands.
+        Without ``loaded_at`` nothing can be told apart and nothing is added.
+        """
+        loaded = str(loaded_at or "").strip()
+        stored = _row_value(previous, "credentials")
+        if not loaded or not stored:
+            return credentials
+        present = {item["id"] for item in credentials}
+        for item in self._decode_credentials(stored):
+            if (
+                item.get("type") == CRED_COOKIE
+                and item.get("source_credential_id") in present
+                and item.get("id") not in present
+                and str(item.get("value_updated_at") or "") > loaded
+            ):
+                credentials.append(item)
+                present.add(item["id"])
+        return credentials
+
     def _seal_text(
         self,
         value: Any,
@@ -881,6 +915,21 @@ class DatabaseManager:
     # ------------------------------------------------------------------
     # Scheduled task state
     # ------------------------------------------------------------------
+    def get_metadata(self, key: str) -> str | None:
+        """Read one ``storage_metadata`` value, None when unset."""
+        with self._lock, self._connection() as conn:
+            row = conn.execute("SELECT value FROM storage_metadata WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_metadata(self, key: str, value: str) -> None:
+        """Write one ``storage_metadata`` value."""
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "INSERT INTO storage_metadata (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
     def get_task_states(self) -> dict[tuple[str, str], dict[str, Any]]:
         """Every task's run state, keyed by ``(site_id, task_id)``."""
         with self._lock, self._connection() as conn:
