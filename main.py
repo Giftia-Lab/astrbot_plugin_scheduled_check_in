@@ -51,6 +51,7 @@ from .core.site_schema import (
     NEW_API_USER_HEADER,
     SITE_TYPE_NEW_API,
     normalize_site_type,
+    validate_checkin_schedule,
 )
 from .core.storage import DEFAULT_SETTINGS, SLOT_WEBAUTHN, DatabaseManager
 from .core.task_scheduler import LOG_TYPE_TASK, TaskScheduler
@@ -88,7 +89,7 @@ async def _read_json_body() -> tuple[bool, Any]:
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
     "LLM API 中转站自动签到插件，支持 Pages 可视化配置与定时广播简报",
-    "1.4.0",
+    "1.5.0",
 )
 class ScheduledCheckInPlugin(Star):
     """Star plugin managing auto sign-ins for API relay stations."""
@@ -428,7 +429,18 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        return json_response(self.get_sites_for_display())
+        sites = self.get_sites_for_display()
+        for site in sites:
+            # A site's own next check-in time, for the table; absent when it
+            # follows the global one.
+            try:
+                target = self.scheduler.site_target_info(site)
+            except Exception as exc:
+                logger.warning(f"Could not work out a site's check-in time: {exc}")
+                target = None
+            if target is not None:
+                site["checkin_target"] = target
+        return json_response(sites)
 
     async def api_save_sites(self) -> Any:
         """Web API: Save sites.
@@ -446,6 +458,10 @@ class ScheduledCheckInPlugin(Star):
         for site in sites:
             if site.get("locked"):
                 continue  # a locked site's stored tasks are kept, not replaced
+            checkin = site.get("checkin")
+            problem = validate_checkin_schedule(checkin.get("schedule") if isinstance(checkin, dict) else None)
+            if problem:
+                return error_response(f"站点「{site.get('name') or ''}」：{problem}")
             for task in normalize_tasks(site.get("tasks")):
                 problem = validate_task(task)
                 if problem:

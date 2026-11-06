@@ -1717,6 +1717,15 @@ input:checked + .slider:before {
   flex: 0 0 110px;
 }
 
+/* A site's own check-in time, under its mode select. */
+.checkin-schedule-row {
+  margin-top: 8px;
+}
+
+.checkin-schedule-row input[type="time"] {
+  flex: 0 0 140px;
+}
+
 /* What a task's "solve Vs PoW" switch reveals: the purpose field and its hint. */
 .pow-purpose-row {
   margin-top: 8px;

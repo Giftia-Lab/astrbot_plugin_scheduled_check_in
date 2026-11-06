@@ -148,6 +148,9 @@ class SiteWriteback:
     # id. Storing them keeps the next run from replaying a retired session.
     credential_values: dict[str, str] = field(default_factory=dict)
     provider_cookies: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Station session cookies a login or refresh produced, keyed by the OAuth
+    # credential's id, to be kept as a Cookie credential of the site too.
+    station_cookies: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return whether there is nothing to persist."""
@@ -157,6 +160,7 @@ class SiteWriteback:
             and not self.oauth_sessions
             and not self.credential_values
             and not self.provider_cookies
+            and not self.station_cookies
         )
 
 
@@ -190,6 +194,8 @@ def persist_writeback(db: Any, site_id: str, writeback: SiteWriteback | None) ->
                 db.update_credential_value(
                     site_id, credential_id, value, provider_cookies=cookies
                 )
+        for credential_id, session_cookie in writeback.station_cookies.items():
+            db.upsert_station_cookie(site_id, credential_id, session_cookie)
     except Exception as exc:
         logger.warning(f"Could not persist discovered config for site {site_id}: {exc}")
 
@@ -523,6 +529,8 @@ class BaseCheckInAdapter(ABC):
         if credential_id:
             self.writeback.oauth_sessions[credential_id] = session_cookie
             self.writeback.oauth_tokens[credential_id] = (access_token, credential["access_expires_at"])
+            if session_cookie:
+                self.writeback.station_cookies[credential_id] = session_cookie
 
     async def _oauth_login(self, credential: dict[str, Any]) -> tuple[str, str]:
         """Run an OAuth login and remember the resulting station session.
@@ -1048,7 +1056,7 @@ class BaseCheckInAdapter(ABC):
         if not (self.vs_pow and purpose):
             response, auth = await self._request_action(method, url, auth, action, step=step, body=body)
             if response.pow_refused:
-                response.pow_failure = self._pow_failure(purpose, {}, in_task)
+                response.pow_failure = self._pow_failure(purpose, {}, in_task, auth)
             return response, auth
 
         async def fetch(challenge: str) -> tuple[int, str]:
@@ -1070,13 +1078,20 @@ class BaseCheckInAdapter(ABC):
         if error:
             return _TextResponse(status=0, text="", pow_failure=error), auth
         if response.pow_refused:
-            response.pow_failure = self._pow_failure(purpose, proof, in_task)
+            response.pow_failure = self._pow_failure(purpose, proof, in_task, auth)
         return response, auth
 
-    def _pow_failure(self, purpose: str, proof: dict[str, str], in_task: bool) -> str:
+    def _pow_failure(
+        self, purpose: str, proof: dict[str, str], in_task: bool, auth: _AuthContext
+    ) -> str:
         """Why a request was refused over its proof of work, and what to change."""
         if self.vs_pow and not purpose:
             return "站点要求 Vs PoW，并非凭据失效：请在任务中开启「请求前求解 Vs PoW」并填写该接口的题目用途"
+        if self.vs_pow and not proof and (auth.credential or {}).get("type") == CRED_TOKEN:
+            # vsllm.cc's challenge route reads only the web session cookie and
+            # answers any token with "未登录", while the guarded route itself
+            # accepts the token, so only the credential type can be changed.
+            return "站点的 PoW 题目接口不认令牌凭据，未取到题目：请改用 Cookie 或 OAuth 凭据"
         message = refusal_message(self.vs_pow, bool(proof))
         if proof and in_task:
             message += f"；请确认题目用途「{purpose}」与该接口一致"
