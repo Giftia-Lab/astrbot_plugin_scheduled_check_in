@@ -88,7 +88,7 @@ async def _read_json_body() -> tuple[bool, Any]:
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
     "LLM API 中转站自动签到插件，支持 Pages 可视化配置与定时广播简报",
-    "1.4.0",
+    "1.5.0",
 )
 class ScheduledCheckInPlugin(Star):
     """Star plugin managing auto sign-ins for API relay stations."""
@@ -428,7 +428,18 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        return json_response(self.get_sites_for_display())
+        sites = self.get_sites_for_display()
+        for site in sites:
+            # A site's own next check-in time, for the table; absent when it
+            # follows the global one.
+            try:
+                target = self.scheduler.site_target_info(site)
+            except Exception as exc:
+                logger.warning(f"Could not work out a site's check-in time: {exc}")
+                target = None
+            if target is not None:
+                site["checkin_target"] = target
+        return json_response(sites)
 
     async def api_save_sites(self) -> Any:
         """Web API: Save sites.

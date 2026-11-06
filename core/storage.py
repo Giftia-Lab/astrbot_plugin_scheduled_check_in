@@ -33,6 +33,7 @@ from .site_schema import (
     ACTION_CHECKIN,
     CRED_COOKIE,
     CRED_TOKEN,
+    credential_label,
     holds_refresh_cookie,
     normalize_action,
     normalize_credential_type,
@@ -528,7 +529,9 @@ class DatabaseManager:
             "base_url": row["base_url"],
             "proxy": self.vault.decrypt_or_placeholder(row["proxy"]),
             "credentials": [] if locked else self._decode_credentials(row["credentials"]),
-            "checkin": self._decode_action(row["checkin_config"], row["checkin_headers"], locked, allow_oauth=True),
+            "checkin": self._decode_action(
+                row["checkin_config"], row["checkin_headers"], locked, allow_oauth=True, scheduled=True
+            ),
             "balance": self._decode_action(row["balance_config"], row["balance_headers"], locked, allow_oauth=False),
             "tasks": join_tasks(
                 _load_json(row["tasks_config"], []),
@@ -562,6 +565,7 @@ class DatabaseManager:
         headers_text: str,
         locked: bool,
         allow_oauth: bool,
+        scheduled: bool = False,
     ) -> dict[str, Any]:
         """Rebuild one action config from its plaintext and encrypted columns."""
         raw = _load_json(config_text, {})
@@ -569,7 +573,7 @@ class DatabaseManager:
             raw = {}
         raw = dict(raw)
         raw["headers"] = [] if locked else self._decode_json(headers_text, [])
-        return normalize_action(raw, allow_oauth=allow_oauth)
+        return normalize_action(raw, allow_oauth=allow_oauth, scheduled=scheduled)
 
     def _decode_json(self, stored: str, default: Any) -> Any:
         """Decrypt a protected JSON column, returning ``default`` when unusable."""
@@ -609,7 +613,17 @@ class DatabaseManager:
             credentials = normalize_credentials(site.get("credentials"))
             credentials = self._carry_oauth_sessions(credentials, previous)
 
-            checkin = normalize_action(site.get("checkin"), allow_oauth=True)
+            raw_checkin = site.get("checkin")
+            if (
+                isinstance(raw_checkin, dict)
+                and "schedule" not in raw_checkin
+                and previous
+            ):
+                # Older clients omit the check-in time; keep the stored one.
+                stored_checkin = _load_json(_row_value(previous, "checkin_config") or "", {})
+                if isinstance(stored_checkin, dict) and "schedule" in stored_checkin:
+                    raw_checkin = {**raw_checkin, "schedule": stored_checkin["schedule"]}
+            checkin = normalize_action(raw_checkin, allow_oauth=True, scheduled=True)
             balance = normalize_action(site.get("balance"), allow_oauth=False)
             # Older clients omit PoW options; only explicit values replace them.
             vs_pow = bool(_row_value(previous, "vs_pow"))
@@ -729,9 +743,20 @@ class DatabaseManager:
         if not known:
             return credentials
         for credential in credentials:
+            match = known.get(credential["id"])
+            if credential["type"] == CRED_COOKIE:
+                # A Cookie an OAuth login wrote back is rewritten underneath
+                # the editor too, so it is omitted when untouched, and the
+                # link to its login is kept whether or not the editor sent it.
+                if isinstance(match, dict) and match.get("type") == CRED_COOKIE:
+                    if not credential["value"]:
+                        credential["value"] = str(match.get("value") or "")
+                        credential["value_updated_at"] = str(match.get("value_updated_at") or "")
+                    if not credential.get("source_credential_id"):
+                        credential["source_credential_id"] = str(match.get("source_credential_id") or "")
+                continue
             if "session_cookie" not in credential:
                 continue
-            match = known.get(credential["id"])
             if not isinstance(match, dict) or match.get("type") != credential["type"]:
                 continue
             if not credential["session_cookie"]:
@@ -1070,6 +1095,71 @@ class DatabaseManager:
                 (self.vault.encrypt_json(credentials), now_str, site_id.strip()),
             )
         logger.info("Rotated credential %s on site %s.", credential_id, site_id)
+        return True
+
+    def upsert_station_cookie(self, site_id: str, source_credential_id: str, cookie: str) -> bool:
+        """Keep an OAuth login's station cookie as a Cookie credential of the site.
+
+        The OAuth credential still caches the session for its own reuse; this
+        puts the same cookie where the user can see, copy and choose it. The
+        Cookie credential this login wrote before is overwritten; failing
+        that, the first Cookie credential the user added by hand, which is
+        then linked to the login; failing that, a new one is added.
+
+        A refresh-token cookie (newer New-API builds) is not written: it
+        authenticates nothing by itself, only mints access tokens.
+
+        Args:
+            site_id: Owning site.
+            source_credential_id: The OAuth credential that logged in.
+            cookie: The station's cookie jar as a ``Cookie`` header value.
+
+        Returns:
+            Whether a credential was added or changed.
+        """
+        value = str(cookie or "").strip()
+        source = str(source_credential_id or "").strip()
+        if not value or not source or holds_refresh_cookie(value):
+            return False
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT credentials FROM sites WHERE id = ?", (site_id.strip(),)
+            ).fetchone()
+            if row is None:
+                return False
+            credentials = self._decode_credentials(row["credentials"])
+            owner = next((item for item in credentials if item.get("id") == source), None)
+            if owner is None:
+                return False
+            cookies = [item for item in credentials if item.get("type") == CRED_COOKIE]
+            target = next(
+                (item for item in cookies if item.get("source_credential_id") == source),
+                None,
+            ) or next((item for item in cookies if not item.get("source_credential_id")), None)
+            if target is None:
+                ids = {item.get("id") for item in credentials}
+                new_id = f"{source}_station_cookie"
+                while new_id in ids:
+                    new_id += "_1"
+                owner_label = str(owner.get("label") or "").strip() or credential_label(owner)
+                target = {
+                    "id": new_id,
+                    "type": CRED_COOKIE,
+                    "label": f"{owner_label} 登录 Cookie",
+                    "value": "",
+                }
+                credentials.append(target)
+            elif target.get("value") == value and target.get("source_credential_id") == source:
+                return False
+            target["value"] = value
+            target["source_credential_id"] = source
+            target["value_updated_at"] = now_str
+            conn.execute(
+                "UPDATE sites SET credentials = ?, updated_at = ? WHERE id = ?",
+                (self.vault.encrypt_json(normalize_credentials(credentials)), now_str, site_id.strip()),
+            )
+        logger.info("Stored the station cookie of credential %s on site %s.", source, site_id)
         return True
 
     def update_action_headers(
@@ -1878,14 +1968,14 @@ def _load_json(text: Any, default: Any) -> Any:
 
 def _dump_action_config(action: dict[str, Any]) -> str:
     """Serialize the non-sensitive half of an action config."""
-    return json.dumps(
-        {
-            "path": action.get("path", ""),
-            "protocol": action.get("protocol", "auto"),
-            "credential_id": action.get("credential_id", ""),
-        },
-        ensure_ascii=False,
-    )
+    config = {
+        "path": action.get("path", ""),
+        "protocol": action.get("protocol", "auto"),
+        "credential_id": action.get("credential_id", ""),
+    }
+    if "schedule" in action:
+        config["schedule"] = action["schedule"]
+    return json.dumps(config, ensure_ascii=False)
 
 
 def _split_tasks(raw: Any) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:

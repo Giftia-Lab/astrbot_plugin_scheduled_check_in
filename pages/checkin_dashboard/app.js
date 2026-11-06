@@ -385,6 +385,12 @@ function renderSitesTable() {
 
     const statusCell = document.createElement('td');
     statusCell.appendChild(renderCheckInStatus(site));
+    if (site.checkin_target && site.checkin_target.display_text) {
+      const target = document.createElement('div');
+      target.className = 'form-hint';
+      target.textContent = `自定义时间：${site.checkin_target.display_text}`;
+      statusCell.appendChild(target);
+    }
     row.appendChild(statusCell);
 
     const enabledCell = document.createElement('td');
@@ -1068,6 +1074,15 @@ function buildCredentialCard(credential) {
     body.appendChild(inlineGroup);
   }
 
+  if (credential.type === 'cookie' && credential.source_credential_id) {
+    const source = credentialDraft.find(item => item.id === credential.source_credential_id);
+    const state = document.createElement('div');
+    state.className = 'cred-session-state has-session';
+    state.textContent = `由「${source ? (source.label || CREDENTIAL_LABELS[source.type]) : '已删除的 OAuth 凭据'}」登录后自动回写`
+      + `${credential.value_updated_at ? ` (${credential.value_updated_at})` : ''}，每次登录覆盖；签到与余额需在各自页面选用它才会使用。`;
+    body.appendChild(state);
+  }
+
   if (isOauth) {
     const state = document.createElement('div');
     const hasSession = credential.has_session === true || Boolean(credential.session_cookie);
@@ -1360,15 +1375,65 @@ function fillActionForm(action, config) {
     const wanted = source.credential_id || '';
     credential.value = credentialDraft.some(item => item.id === wanted) ? wanted : '';
   }
+  if (action === 'checkin') fillCheckinSchedule(source.schedule);
 }
 
 function readActionForm(action) {
-  return {
+  const config = {
     path: document.getElementById(`${action}-path`)?.value.trim() || '',
     protocol: document.getElementById(`${action}-protocol`)?.value || 'auto',
     credential_id: document.getElementById(`${action}-credential`)?.value || '',
     headers: getHeaderPairs(action)
   };
+  if (action === 'checkin') config.schedule = readCheckinSchedule();
+  return config;
+}
+
+const CHECKIN_SCHEDULE_DEFAULTS = { mode: 'global', time: '08:30', start: '08:00', end: '10:30' };
+
+/** Load a site's own check-in time into the 签到 tab. */
+function fillCheckinSchedule(schedule) {
+  const source = { ...CHECKIN_SCHEDULE_DEFAULTS, ...(schedule && typeof schedule === 'object' ? schedule : {}) };
+  document.getElementById('checkin-schedule-mode').value = source.mode;
+  document.getElementById('checkin-schedule-time').value = source.time;
+  document.getElementById('checkin-schedule-start').value = source.start;
+  document.getElementById('checkin-schedule-end').value = source.end;
+  renderCheckinScheduleFields();
+}
+
+/** Every field is sent whatever the mode, so switching back loses nothing. */
+function readCheckinSchedule() {
+  const value = id => document.getElementById(id)?.value || '';
+  return {
+    mode: value('checkin-schedule-mode') || 'global',
+    time: value('checkin-schedule-time') || CHECKIN_SCHEDULE_DEFAULTS.time,
+    start: value('checkin-schedule-start') || CHECKIN_SCHEDULE_DEFAULTS.start,
+    end: value('checkin-schedule-end') || CHECKIN_SCHEDULE_DEFAULTS.end
+  };
+}
+
+function renderCheckinScheduleFields() {
+  const mode = document.getElementById('checkin-schedule-mode')?.value || 'global';
+  document.getElementById('checkin-schedule-fixed').style.display = mode === 'fixed' ? '' : 'none';
+  document.getElementById('checkin-schedule-range').style.display = mode === 'range' ? '' : 'none';
+  const hint = document.getElementById('checkin-schedule-hint');
+  if (hint) {
+    hint.textContent = mode === 'global'
+      ? '按「定时签到设置」中的时间与其他站点一起签到。'
+      : mode === 'fixed'
+        ? '每天在该时间单独签到，不再随全局时间签到；简报单独推送。'
+        : '每天在该范围内随机选一个时刻单独签到，不再随全局时间签到；简报单独推送。';
+  }
+}
+
+/** Check that a site's own range runs forwards within one day. */
+function validateCheckinSchedule(schedule) {
+  if (schedule.mode === 'fixed' && !schedule.time) return '请填写签到时间';
+  if (schedule.mode === 'range') {
+    if (!schedule.start || !schedule.end) return '请填写签到时间范围';
+    if (schedule.end < schedule.start) return '签到时间范围的结束不能早于开始';
+  }
+  return '';
 }
 
 /**
@@ -2002,6 +2067,16 @@ async function runTaskNow(taskId, button, output) {
   }
 }
 
+/**
+ * Whether runs rewrite this credential's value while the editor is open:
+ * OAuth provider cookies rotate, and an OAuth login overwrites the station
+ * Cookie it wrote back. Such a value is left out of a save when untouched.
+ */
+function rewrittenByRuns(credential) {
+  return OAUTH_TYPES.includes(credential.type)
+    || (credential.type === 'cookie' && Boolean(credential.source_credential_id));
+}
+
 /** Build a site payload from the editor, for actions that run before saving. */
 function buildSitePayloadFromForm() {
   const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
@@ -2018,8 +2093,9 @@ function buildSitePayloadFromForm() {
         label: credential.label || ''
       };
       // Omitting the value means "unchanged"; storage restores the stored one.
-      // Only OAuth cookies rotate underneath us, so only they are eligible.
-      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+      // Only cookies rewritten underneath us are eligible: OAuth provider
+      // cookies, and the station Cookie an OAuth login writes back.
+      const untouchedOauthCookie = rewrittenByRuns(credential)
         && credential.loadedValue
         && credential.value === credential.loadedValue;
       if (!untouchedOauthCookie) entry.value = credential.value || '';
@@ -2134,6 +2210,12 @@ async function submitSiteForm() {
     switchSiteTab('checkin');
     return;
   }
+  const scheduleProblem = validateCheckinSchedule(checkin.schedule);
+  if (scheduleProblem) {
+    showToast(scheduleProblem, 'warning');
+    switchSiteTab('checkin');
+    return;
+  }
 
   const tasks = readTasksForSave();
   for (const task of taskDraft) {
@@ -2161,8 +2243,8 @@ async function submitSiteForm() {
         label: credential.label || ''
       };
       // Omitting the value means "unchanged"; storage restores the stored one.
-      // Only OAuth cookies rotate underneath us, so only they are eligible.
-      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+      // Only cookies rewritten underneath us are eligible; see rewrittenByRuns.
+      const untouchedOauthCookie = rewrittenByRuns(credential)
         && credential.loadedValue
         && credential.value === credential.loadedValue;
       if (!untouchedOauthCookie) entry.value = credential.value || '';

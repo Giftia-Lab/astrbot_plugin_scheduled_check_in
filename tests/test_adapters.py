@@ -1443,12 +1443,27 @@ class PowCheckInTests(unittest.IsolatedAsyncioTestCase):
                 FakeResponse(200, POW_REFUSED),
             )
         )
-        result = await create_adapter(self._site(), session).check_in()
+        site = self._site(credentials=[{"id": "c1", "type": "cookie", "value": "session=s"}])
+        result = await create_adapter(site, session).check_in()
         self.assertFalse(result.success)
         self.assertFalse(result.expired)
         self.assertIn("未取到可用的题目", result.message)
         self.assertNotIn("并非凭据失效", result.message)
         # Sent bare once: without a challenge a resend would only be refused again.
+        self.assertEqual(session.count_to("/api/user/checkin"), 1)
+
+    async def test_a_token_without_a_challenge_points_at_another_credential(self) -> None:
+        """vsllm.cc hands check-in challenges to session cookies only, never to a token."""
+        session = FakeSession(
+            self._routes(
+                FakeResponse(200, '{"message":"未登录","success":false}'),
+                FakeResponse(200, POW_REFUSED),
+            )
+        )
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("请改用 Cookie 或 OAuth 凭据", result.message)
         self.assertEqual(session.count_to("/api/user/checkin"), 1)
 
     async def test_a_challenge_too_hard_to_solve_never_reaches_the_check_in(self) -> None:

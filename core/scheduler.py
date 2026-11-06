@@ -4,16 +4,50 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime
+from collections.abc import Collection
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from .adapters import CheckInResult, create_adapter, persist_writeback
 from .http_client import RequestOptions, create_client_session
+from .site_schema import (
+    CHECKIN_SCHEDULE_FIXED,
+    site_checkin_schedule,
+    time_of_day_minutes,
+)
 
 logger = logging.getLogger("astrbot")
 
 # Shown when a run is skipped because the configuration is still encrypted.
 LOCKED_MESSAGE = "配置已加密未解锁，请在 Web 端输入密钥后重试"
+
+
+def draw_checkin_time(
+    schedule: dict[str, str],
+    day: date,
+    earliest: datetime | None = None,
+) -> datetime | None:
+    """Pick a site's check-in moment on ``day`` from its own schedule.
+
+    Args:
+        schedule: A normalized fixed or range schedule.
+        day: The day to pick on.
+        earliest: Nothing before this minute; the current minute itself is
+            still usable, as it is for the global window.
+
+    Returns:
+        The moment, or None when ``earliest`` leaves nothing of the day's slot.
+    """
+    if schedule["mode"] == CHECKIN_SCHEDULE_FIXED:
+        low = high = time_of_day_minutes(schedule["time"])
+    else:
+        low, high = time_of_day_minutes(schedule["start"]), time_of_day_minutes(schedule["end"])
+    if earliest is not None and earliest.date() == day:
+        low = max(low, earliest.hour * 60 + earliest.minute)
+    if low > high:
+        return None
+    minutes = random.randint(low, high)
+    return datetime.combine(day, time(minutes // 60, minutes % 60))
 
 
 class CheckInScheduler:
@@ -34,6 +68,10 @@ class CheckInScheduler:
         self._today_date_str: str = ""
         self._persistence_lock = asyncio.Lock()
         self._history_lock = asyncio.Lock()
+        # Sites with their own check-in time: the schedule each next moment
+        # was drawn from, and that moment; and the day each last fired.
+        self._site_targets: dict[str, tuple[tuple[str, ...], datetime]] = {}
+        self._site_last_run: dict[str, str] = {}
 
     def reset_today_target_time(self) -> None:
         """Reset cached target time when settings are updated."""
@@ -159,6 +197,77 @@ class CheckInScheduler:
         self._running = True
         self._task = asyncio.create_task(self._scheduler_loop())
         logger.info("CheckInScheduler started background loop.")
+
+    def _site_target(self, site: dict[str, Any], now: datetime) -> datetime | None:
+        """When a site with its own check-in time checks in next.
+
+        Drawn once and kept, like the global target, until the site fires or
+        its schedule changes. A target of an earlier day was never reached
+        and is redrawn rather than run a day late; one earlier today is still
+        run, so a busy loop delays a check-in instead of losing it.
+
+        Returns:
+            The moment, or None for a site following the global time.
+        """
+        site_id = self._normalize_site_id(site.get("id"))
+        schedule = site_checkin_schedule(site)
+        if not site_id or schedule is None:
+            return None
+        key = tuple(schedule.values())
+        cached = self._site_targets.get(site_id)
+        if cached is not None and cached[0] == key and cached[1].date() >= now.date():
+            return cached[1]
+        today = now.date()
+        target = None
+        if self._site_last_run.get(site_id) != today.isoformat():
+            target = draw_checkin_time(schedule, today, earliest=now)
+        if target is None:
+            target = draw_checkin_time(schedule, today + timedelta(days=1))
+        self._site_targets[site_id] = (key, target)
+        return target
+
+    def site_target_info(self, site: dict[str, Any]) -> dict[str, Any] | None:
+        """A site's own next check-in time for the dashboard.
+
+        Returns:
+            Dict with target_time, is_tomorrow and display_text, or None when
+            the site follows the global time or automatic check-in is off.
+        """
+        if not self.plugin.get_settings().get("enabled", True):
+            return None
+        now = datetime.now()
+        target = self._site_target(site, now)
+        if target is None:
+            return None
+        is_tomorrow = target.date() > now.date()
+        hhmm = target.strftime("%H:%M")
+        return {
+            "target_time": hhmm,
+            "is_tomorrow": is_tomorrow,
+            "display_text": f"{'明日' if is_tomorrow else '今日'} {hhmm}",
+        }
+
+    def _due_sites(self, now: datetime) -> list[str]:
+        """Sites with their own check-in time that are due now.
+
+        Each fires once a day. One that already checked in successfully
+        today, by hand or otherwise, is passed over without a run.
+        """
+        today = now.strftime("%Y-%m-%d")
+        due: list[str] = []
+        for site in self.plugin.get_sites():
+            if site.get("enabled") is not True:
+                continue
+            target = self._site_target(site, now)
+            if target is None or target > now:
+                continue
+            site_id = self._normalize_site_id(site.get("id"))
+            self._site_last_run[site_id] = today
+            self._site_targets.pop(site_id, None)
+            if site.get("last_checkin_date") == today and site.get("last_checkin_success"):
+                continue
+            due.append(site_id)
+        return due
 
     def stop(self) -> None:
         """Stop the background scheduler task."""
@@ -302,15 +411,19 @@ class CheckInScheduler:
                     if current_hhmm == target_time and self._last_run_date != current_date:
                         self._last_run_date = current_date
                         logger.info(f"Triggering scheduled daily check-in at target time ({target_time})...")
-                        results = await self.run_check_in_all()
-                        settings = self.plugin.get_settings()
-                        report_level = settings.get("report_level", "all")
-                        report_session = str(settings.get("lock_notify_session") or "").strip()
-                        report_text = self.format_report(results, report_level=report_level)
-                        if report_text:
-                            await self.plugin.send_notification(report_text, session=report_session)
-                        else:
-                            logger.info("Scheduled check-in completed; report skipped based on reporting level.")
+                        results = await self.run_check_in_all(own_schedule=False)
+                        # Every site may check in at its own time, leaving
+                        # nothing for this run to report.
+                        if results or not self._has_own_schedule_sites():
+                            await self._send_report(results)
+
+                if info.get("enabled"):
+                    due = self._due_sites(datetime.now())
+                    if due:
+                        logger.info(f"Triggering check-in of {len(due)} site(s) at their own time...")
+                        results = await self.run_check_in_all(only=due)
+                        if results:
+                            await self._send_report(results)
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -318,6 +431,24 @@ class CheckInScheduler:
             except Exception as e:
                 logger.error(f"Error in CheckInScheduler loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    def _has_own_schedule_sites(self) -> bool:
+        """Whether any enabled site checks in at its own time."""
+        return any(
+            site.get("enabled") is True and site_checkin_schedule(site) is not None
+            for site in self.plugin.get_sites()
+        )
+
+    async def _send_report(self, results: list[CheckInResult]) -> None:
+        """Push a scheduled run's briefing at the configured reporting level."""
+        settings = self.plugin.get_settings()
+        report_level = settings.get("report_level", "all")
+        report_session = str(settings.get("lock_notify_session") or "").strip()
+        report_text = self.format_report(results, report_level=report_level)
+        if report_text:
+            await self.plugin.send_notification(report_text, session=report_session)
+        else:
+            logger.info("Scheduled check-in completed; report skipped based on reporting level.")
 
     async def _poll_lock_alert(self) -> None:
         """Ask the plugin to push its locked-vault alert if one is due.
@@ -363,12 +494,21 @@ class CheckInScheduler:
             self._record_checkin_history(results, manual)
         return results
 
-    async def run_check_in_all(self, manual: bool = False, force: bool = False) -> list[CheckInResult]:
+    async def run_check_in_all(
+        self,
+        manual: bool = False,
+        force: bool = False,
+        own_schedule: bool = True,
+        only: Collection[str] | None = None,
+    ) -> list[CheckInResult]:
         """Execute check-in for all enabled sites.
 
         Args:
             manual: Flag indicating if this was triggered manually.
             force: If True, execute check-in even if already signed in today.
+            own_schedule: Include sites with their own check-in time. The
+                global scheduled run leaves them to their own.
+            only: Restrict the run to these site ids.
 
         Returns:
             List of CheckInResult objects.
@@ -378,6 +518,7 @@ class CheckInScheduler:
 
         all_sites = self.plugin.get_sites()
         enabled_sites: list[dict[str, Any]] = []
+        wanted = None if only is None else {self._normalize_site_id(site_id) for site_id in only}
         for site_config in all_sites:
             site_id = self._normalize_site_id(site_config.get("id"))
             if not site_id:
@@ -391,6 +532,10 @@ class CheckInScheduler:
                     "Skipping site %s because enabled is not true",
                     site_id,
                 )
+                continue
+            if wanted is not None and site_id not in wanted:
+                continue
+            if not own_schedule and site_checkin_schedule(site_config) is not None:
                 continue
             enabled_sites.append(site_config)
         results: list[CheckInResult] = []
@@ -445,8 +590,9 @@ class CheckInScheduler:
                 results.append(result)
                 site_results_to_persist.append(result)
 
-        # Clear temporary manual_target_time override after check-in execution
-        if settings.get("manual_target_time"):
+        # Clear temporary manual_target_time override after check-in execution;
+        # a site checking in at its own time leaves the global run's alone.
+        if only is None and settings.get("manual_target_time"):
             settings["manual_target_time"] = ""
             self.plugin.save_settings(settings)
             self.reset_today_target_time()

@@ -126,18 +126,12 @@
                 <span class="slider"></span>
               </label>
             </div>
-            <div class="form-group">
-              <div style="display: flex; align-items: center; justify-content: space-between;">
-                <label style="margin: 0;" for="site-vs-pow">求解 Vs PoW</label>
-                <label class="switch">
-                  <input type="checkbox" id="site-vs-pow" />
-                  <span class="slider"></span>
-                </label>
-              </div>
-              <div class="form-hint">
-                仅适用于 vsllm.cc 的工作量证明（只按其前端实现，其他站点即使有类似机制也不保证兼容）。开启后签到与 OAuth 登录前
-                自动求解，定时任务另需在任务卡片中填写题目用途，余额查询无需求解；关闭时不会请求 <code>/api/pow/challenge</code>。
-              </div>
+            <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+              <label style="margin: 0;" for="site-vs-pow">求解 Vs PoW</label>
+              <label class="switch">
+                <input type="checkbox" id="site-vs-pow" />
+                <span class="slider"></span>
+              </label>
             </div>
           </div>
 
@@ -159,6 +153,23 @@
           <!-- Tab: 签到 -->
           <div class="tab-panel" data-panel="checkin">
             <div class="panel-intro">不填写将根据框架探测。</div>
+            <div class="form-group">
+              <label for="checkin-schedule-mode">签到时间</label>
+              <select id="checkin-schedule-mode" class="form-control" onchange="renderCheckinScheduleFields()">
+                <option value="global">跟随全局设置</option>
+                <option value="fixed">固定时间</option>
+                <option value="range">时间范围内随机</option>
+              </select>
+              <div class="task-row checkin-schedule-row" id="checkin-schedule-fixed" style="display: none;">
+                <input type="time" id="checkin-schedule-time" class="form-control" value="08:30" />
+              </div>
+              <div class="task-row checkin-schedule-row" id="checkin-schedule-range" style="display: none;">
+                <input type="time" id="checkin-schedule-start" class="form-control" value="08:00" />
+                <span>~</span>
+                <input type="time" id="checkin-schedule-end" class="form-control" value="10:30" />
+              </div>
+              <div class="form-hint" id="checkin-schedule-hint"></div>
+            </div>
             <div class="form-group">
               <label>自定义 Path</label>
               <input type="text" id="checkin-path" class="form-control" placeholder="留空根据框架适配" />

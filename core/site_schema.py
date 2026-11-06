@@ -72,6 +72,26 @@ REFRESH_COOKIE_NAME = "new_api_refresh"
 ACTION_CHECKIN = "checkin"
 ACTION_BALANCE = "balance"
 
+# ----------------------------------------------------------------------
+# Check-in schedule
+# ----------------------------------------------------------------------
+# A site checks in at the global time unless its check-in action names its
+# own: a fixed time of day, or a random one within a range.
+CHECKIN_SCHEDULE_GLOBAL = "global"
+CHECKIN_SCHEDULE_FIXED = "fixed"
+CHECKIN_SCHEDULE_RANGE = "range"
+CHECKIN_SCHEDULE_MODES: tuple[str, ...] = (
+    CHECKIN_SCHEDULE_GLOBAL,
+    CHECKIN_SCHEDULE_FIXED,
+    CHECKIN_SCHEDULE_RANGE,
+)
+DEFAULT_CHECKIN_SCHEDULE: dict[str, str] = {
+    "mode": CHECKIN_SCHEDULE_GLOBAL,
+    "time": "08:30",
+    "start": "08:00",
+    "end": "10:30",
+}
+
 
 # ----------------------------------------------------------------------
 # Headers
@@ -291,6 +311,11 @@ def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
     if cred_type == CRED_TOKEN:
         # Users paste raw tokens far more often than "Bearer <token>".
         credential["auto_bearer"] = bool(source.get("auto_bearer", True))
+    if cred_type == CRED_COOKIE:
+        # The OAuth credential whose login wrote this station cookie, empty
+        # for one the user pasted; see DatabaseManager.upsert_station_cookie.
+        credential["source_credential_id"] = str(source.get("source_credential_id") or "").strip()
+        credential["value_updated_at"] = str(source.get("value_updated_at") or "").strip()
     if cred_type in OAUTH_CREDENTIAL_TYPES:
         credential["provider_cookies"] = normalize_provider_cookies(
             source.get("provider_cookies")
@@ -381,7 +406,7 @@ def resolve_credential(credentials: Any, protocol: str) -> CredentialPlan:
             return CredentialPlan("oauth", None, "签到协议为 OAuth，但未配置 OAuth 凭据")
         return CredentialPlan("oauth", chosen)
 
-    chosen = _first_of_type(items, REQUEST_CREDENTIAL_TYPES)
+    chosen = _first_of_type(_pickable(items), REQUEST_CREDENTIAL_TYPES)
     if chosen is not None:
         return CredentialPlan("request", chosen)
 
@@ -389,6 +414,20 @@ def resolve_credential(credentials: Any, protocol: str) -> CredentialPlan:
     if fallback is not None:
         return CredentialPlan("oauth", fallback, "未配置 Token/Cookie 凭据，改用 OAuth 登录")
     return CredentialPlan("request", None, "站点未配置可用凭据")
+
+
+def _pickable(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Credentials an action may pick when it names none.
+
+    A Cookie a login wrote back is left out. Picking it would quietly turn
+    the action away from the OAuth login it came from, which logs in again
+    when the session expires, to a copy that cannot. It is still used when
+    an action names it.
+    """
+    return [
+        item for item in items
+        if not (item.get("type") == CRED_COOKIE and item.get("source_credential_id"))
+    ]
 
 
 def resolve_action_credential(credentials: Any, action: Any) -> CredentialPlan:
@@ -425,25 +464,76 @@ def normalize_path(raw: Any) -> str:
     return path if path.startswith("/") else f"/{path}"
 
 
-def normalize_action(raw: Any, allow_oauth: bool) -> dict[str, Any]:
+def normalize_action(raw: Any, allow_oauth: bool, scheduled: bool = False) -> dict[str, Any]:
     """Normalize one action (check-in or balance) config block.
 
     Args:
         raw: Raw action mapping.
         allow_oauth: Whether the OAuth protocol is selectable.
+        scheduled: Whether the action carries its own time of day, as the
+            check-in action does.
 
     Returns:
-        An action dict with path, protocol, credential_id and headers. The
-        acw_sc__v2 and ML-DSA options are global settings, so the per-action
-        flags earlier versions stored are dropped.
+        An action dict with path, protocol, credential_id and headers, plus
+        the schedule when ``scheduled``. The acw_sc__v2 and ML-DSA options
+        are global settings, so the per-action flags earlier versions stored
+        are dropped.
     """
     source = raw if isinstance(raw, dict) else {}
-    return {
+    action = {
         "path": normalize_path(source.get("path")),
         "protocol": normalize_protocol(source.get("protocol"), allow_oauth=allow_oauth),
         "credential_id": str(source.get("credential_id") or "").strip(),
         "headers": normalize_headers(source.get("headers")),
     }
+    if scheduled:
+        action["schedule"] = normalize_checkin_schedule(source.get("schedule"))
+    return action
+
+
+def normalize_time_of_day(raw: Any, default: str) -> str:
+    """Normalize ``H:MM`` / ``HH:MM`` to ``HH:MM``, ``default`` when invalid."""
+    hours, sep, minutes = str(raw or "").strip().partition(":")
+    if not sep or not hours.isdigit() or not minutes.isdigit():
+        return default
+    hour, minute = int(hours), int(minutes)
+    if hour > 23 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
+
+
+def time_of_day_minutes(text: str) -> int:
+    """Minutes since midnight of a normalized ``HH:MM``."""
+    hours, _, minutes = text.partition(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def normalize_checkin_schedule(raw: Any) -> dict[str, str]:
+    """Normalize a site's own check-in time.
+
+    Every field is kept whatever the mode, so the editor can switch modes
+    without losing what was typed. A range is the same day's: one given
+    backwards is put the right way round.
+    """
+    source = raw if isinstance(raw, dict) else {}
+    mode = str(source.get("mode") or "").strip().lower()
+    start = normalize_time_of_day(source.get("start"), DEFAULT_CHECKIN_SCHEDULE["start"])
+    end = normalize_time_of_day(source.get("end"), DEFAULT_CHECKIN_SCHEDULE["end"])
+    if time_of_day_minutes(end) < time_of_day_minutes(start):
+        start, end = end, start
+    return {
+        "mode": mode if mode in CHECKIN_SCHEDULE_MODES else CHECKIN_SCHEDULE_GLOBAL,
+        "time": normalize_time_of_day(source.get("time"), DEFAULT_CHECKIN_SCHEDULE["time"]),
+        "start": start,
+        "end": end,
+    }
+
+
+def site_checkin_schedule(site: Any) -> dict[str, str] | None:
+    """A site's own check-in time, None when it follows the global one."""
+    checkin = site.get("checkin") if isinstance(site, dict) else None
+    schedule = normalize_checkin_schedule(checkin.get("schedule") if isinstance(checkin, dict) else None)
+    return None if schedule["mode"] == CHECKIN_SCHEDULE_GLOBAL else schedule
 
 
 def normalize_site_type(raw: Any) -> str:
