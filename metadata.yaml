@@ -1,6 +1,6 @@
 name: astrbot_plugin_scheduled_check_in
 display_name: 定时自动签到
 desc: 自动定时签到各种 LLM API 中转站（New-API/One-API等），支持多凭据、OAuth 自动登录、通行密钥加密与 Pages 可视化管理面板
-version: v1.5.0
+version: v1.6.0
 author: e.e. && Sukafon
 repo: https://github.com/MatchaSweetPotato-Lab/astrbot_plugin_scheduled_check_in
