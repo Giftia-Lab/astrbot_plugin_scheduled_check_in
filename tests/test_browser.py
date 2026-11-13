@@ -32,7 +32,7 @@ from core.cloudflare import (
     normalize_cloudflare_settings,
 )
 from core.oauth import LINUXDO_OAUTH, OAuthLoginClient
-from tests.fakes import FakeResponse, FakeSession
+from tests.fakes import POW_NONCE, FakeResponse, FakeSession, pow_challenge, pow_proof
 
 BASE = "https://relay.example.com"
 AUTHORIZE = "https://connect.linux.do/oauth2/authorize"
@@ -53,6 +53,9 @@ class FakeBrowser:
     def __init__(self, *answers: Any) -> None:
         self.answers = list(answers)
         self.calls: list[tuple[BrowserRequest, BrowserOptions, list]] = []
+        # What the Turnstile widget hands out, and the widgets asked for one.
+        self.token: Any = "tok"
+        self.widgets: list[tuple[str, str, str | None]] = []
 
     async def request(self, request: BrowserRequest, options: BrowserOptions, clearance: Any = ()) -> BrowserOutcome:
         self.calls.append((request, options, list(clearance)))
@@ -60,6 +63,14 @@ class FakeBrowser:
         if isinstance(answer, Exception):
             raise answer
         return BrowserOutcome(answer, CLEARANCE, "Chrome 153", 4.2, solved=True)
+
+    async def turnstile_token(
+        self, url: str, sitekey: str, options: BrowserOptions, proxy: str | None = None
+    ) -> tuple[str, str]:
+        self.widgets.append((url, sitekey, proxy))
+        if isinstance(self.token, Exception):
+            raise self.token
+        return self.token, "Chrome 153"
 
 
 def context(browser: Any, **options: Any) -> CloudflareContext:
@@ -448,6 +459,106 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("session=abc" in call[0].headers.get("Cookie", "") for call in browser.calls))
         self.assertIn("Cloudflare 无头浏览器", [a["step"] for a in adapter.attempts])
         self.assertNotIn("Cloudflare 指纹轮换", [a["step"] for a in adapter.attempts])
+
+
+class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
+    """New-API's Turnstile check on the check-in, as api.futureppo.top has it on."""
+
+    CHECKIN = f"{BASE}/api/user/checkin"
+    REFUSED = '{"message":"Turnstile token 为空","success":false}'
+
+    def _session(self, status: Any = None, with_token: Any = None) -> FakeSession:
+        return FakeSession({
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(
+                200, json.dumps({"success": True, "data": {"id": 7, "quota": 500000}})
+            ),
+            ("POST", self.CHECKIN): FakeResponse(200, self.REFUSED),
+            ("GET", f"{BASE}/api/status"): status or FakeResponse(
+                200, '{"success":true,"data":{"turnstile_check":true,"turnstile_site_key":"0xKEY"}}'
+            ),
+            ("POST", f"{self.CHECKIN}?turnstile=tok"): with_token or FakeResponse(
+                200, '{"success":true,"message":"签到成功"}'
+            ),
+        })
+
+    @staticmethod
+    def _site(**overrides: Any) -> dict[str, Any]:
+        return {
+            "id": "s1", "name": "Relay", "type": "new-api", "base_url": BASE, "proxy": "http://p:1",
+            "credentials": [{"id": "c1", "type": "token", "value": "sk-a"}],
+            "checkin": {}, "balance": {}, "enabled": True, **overrides,
+        }
+
+    async def test_a_refused_check_in_is_sent_again_with_a_token(self) -> None:
+        browser, session = FakeBrowser(), self._session()
+        result = await create_adapter(self._site(), session, None, context(browser)).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(result.message, "签到成功")
+        self.assertEqual(browser.widgets, [(f"{BASE}/console/personal", "0xKEY", "http://p:1")])
+        self.assertEqual(
+            [call["url"] for call in session.calls if "/checkin" in call["url"]],
+            [self.CHECKIN, f"{self.CHECKIN}?turnstile=tok"],
+        )
+        steps = [attempt["step"] for attempt in result.attempts]
+        self.assertEqual(steps[1:5], [
+            "签到", "获取 Turnstile 站点密钥", "Turnstile 无头浏览器", "签到（携带 Turnstile token）",
+        ])
+        # The token stays out of the trace.
+        self.assertNotIn("turnstile=tok", json.dumps(result.attempts))
+
+    async def test_a_check_in_that_is_not_refused_never_starts_the_browser(self) -> None:
+        browser, session = FakeBrowser(), self._session()
+        session.routes[("POST", self.CHECKIN)] = FakeResponse(200, '{"success":true}')
+        result = await create_adapter(self._site(), session, None, context(browser)).check_in()
+        self.assertTrue(result.success)
+        self.assertEqual(browser.widgets, [])
+        self.assertEqual(session.count_to("/api/status"), 0)
+
+    async def test_a_token_the_station_refuses_is_not_asked_for_twice(self) -> None:
+        refused = FakeResponse(200, '{"message":"Turnstile 校验失败，请刷新重试！","success":false}')
+        browser, session = FakeBrowser(), self._session(with_token=refused)
+        result = await create_adapter(self._site(), session, None, context(browser)).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("Turnstile 校验失败", result.message)
+        self.assertEqual(len(browser.widgets), 1)
+
+    async def test_why_there_is_no_token_is_reported_without_blaming_the_credential(self) -> None:
+        no_key = FakeResponse(200, '{"success":true,"data":{"turnstile_check":true,"turnstile_site_key":""}}')
+        timed_out, crashed, missing = FakeBrowser(), FakeBrowser(), FakeBrowser()
+        timed_out.token = ""
+        crashed.token = RuntimeError("net::ERR_TIMED_OUT")
+        missing.token = BrowserUnavailable("未安装 Playwright")
+        cases = [
+            (context(FakeBrowser()), no_key, "未提供 turnstile_site_key"),
+            (context(FakeBrowser(), browser_fallback=False), None, "无头浏览器验证已在全局设置中关闭"),
+            (None, None, "未配置浏览器"),
+            (context(timed_out, browser_timeout=30), None, "Chrome 153 在 30 秒内未取得 Turnstile token"),
+            (context(crashed), None, "无头浏览器请求异常：net::ERR_TIMED_OUT"),
+            (context(missing), None, "无头浏览器不可用：未安装 Playwright"),
+        ]
+        for cloudflare, status, expected in cases:
+            with self.subTest(expected=expected):
+                session = self._session(status=status)
+                result = await create_adapter(self._site(), session, None, cloudflare).check_in()
+                self.assertFalse(result.success)
+                self.assertFalse(result.expired)
+                self.assertIn("站点签到要求 Turnstile 验证，并非凭据失效", result.message)
+                self.assertIn(expected, result.message)
+                self.assertEqual(session.count_to("/api/user/checkin"), 1)
+
+    async def test_the_token_request_still_carries_a_proof_of_work(self) -> None:
+        browser, session = FakeBrowser(), self._session()
+        session.routes[("GET", f"{BASE}/api/pow/challenge?purpose=checkin")] = [
+            FakeResponse(200, pow_challenge("tok-1")), FakeResponse(200, pow_challenge("tok-2")),
+        ]
+        site = self._site(vs_pow=True, credentials=[{"id": "c1", "type": "cookie", "value": "session=abc"}])
+        result = await create_adapter(site, session, None, context(browser)).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(
+            [pow_proof(call) for call in session.calls if "/checkin" in call["url"]],
+            [("tok-1", POW_NONCE), ("tok-2", POW_NONCE)],
+        )
 
 
 if __name__ == "__main__":

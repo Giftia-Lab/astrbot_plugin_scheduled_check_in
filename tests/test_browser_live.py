@@ -55,6 +55,14 @@ WIDGET = """<html><body style="margin:0">
 <script>let moves = 0; addEventListener('mousemove', () => moves++);
 document.getElementById('cb').addEventListener('click', e => { if (e.isTrusted) parent.postMessage(moves, '*'); });</script>
 </body></html>"""
+# A page with a site's own Turnstile widget on it: ticking the box has the
+# widget hand the page a token, as Cloudflare's script does.
+TURNSTILE = """<html><body><input type="hidden" name="cf-turnstile-response">
+<script>addEventListener('message', e => {
+  document.querySelector('[name="cf-turnstile-response"]').value = '{sitekey}.' + location.pathname + '.' + (e.data > 3);
+});</script>
+<div style="height:180px"></div><iframe src="http://widget.test/widget" style="width:300px;height:65px;border:0"></iframe>
+</body></html>"""
 # Measured by a challenge page once laid out (a window's outer size reads 0
 # while its first document parses, headed too) and written into a cookie, so
 # it comes back with the response.
@@ -90,6 +98,7 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
                 web.get("/ticked", self.ticked),
                 web.get("/widget", self.widget),
                 web.get("/geometry", self.geometry),
+                web.get("/console/personal", self.console),
                 web.get("/relay/authorize", self.relay_authorize),
                 web.get("/relay/sso", self.relay_sso),
                 web.get("/relay/callback", self.relay_callback),
@@ -178,6 +187,10 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
         if request.cookies.get("cf_clearance") != "ok":
             return web.Response(status=403, text=GEOMETRY, content_type="text/html", headers={"cf-mitigated": "challenge"})
         return web.Response(text="<html>measured</html>", content_type="text/html")
+
+    async def console(self, request: web.Request) -> web.Response:
+        self.hits.append(("console",))
+        return web.Response(text="<html>the station's own page</html>", content_type="text/html")
 
     @staticmethod
     def first_cookie(request: web.Request, name: str) -> str | None:
@@ -385,6 +398,38 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({name for name, _ in self.hits}, {"ticked"})
         # The pointer travelled across the widget, not teleported onto the box.
         self.assertGreater(self.hits[-1][1], 3)
+
+    async def test_a_turnstile_widget_issues_a_token_without_contacting_the_site(self) -> None:
+        # A page the browser answers itself counts as public, and Chrome keeps
+        # public pages from framing this machine, so the stand-in widget is
+        # answered in the browser too, under a host of its own.
+        new_context = self.solver._browser.new_context
+
+        async def with_widget(**options: object) -> object:
+            context = await new_context(**options)
+            await context.route(
+                "http://widget.test/widget",
+                lambda route: route.fulfill(status=200, content_type="text/html", body=WIDGET),
+            )
+            return context
+
+        with mock.patch.object(browser_module, "_CHALLENGE_HOST_SUFFIXES", ("widget.test",)), \
+                mock.patch.object(browser_module, "_TURNSTILE_PAGE", TURNSTILE), \
+                mock.patch.object(self.solver._browser, "new_context", with_widget):
+            token, label = await self.solver.turnstile_token(
+                f"{self.base}/console/personal", '0x"KEY', self.options
+            )
+        # Issued on the site's own address, to a pointer that travelled there.
+        self.assertEqual(token, "0x&quot;KEY./console/personal.true")
+        self.assertTrue(label)
+        self.assertEqual(self.hits, [])
+
+    async def test_a_widget_that_issues_nothing_times_out_empty(self) -> None:
+        with mock.patch.object(browser_module, "_TURNSTILE_PAGE", "<html><body>no widget</body></html>"):
+            token, _ = await self.solver.turnstile_token(
+                f"{self.base}/console/personal", "0xKEY", BrowserOptions(timeout=2)
+            )
+        self.assertEqual(token, "")
 
     async def test_the_window_looks_like_a_desktop_window(self) -> None:
         outcome = await self.solver.request(BrowserRequest("GET", f"{self.base}/geometry"), self.options)

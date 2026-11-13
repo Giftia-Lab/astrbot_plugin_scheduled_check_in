@@ -18,6 +18,10 @@ Two shapes of request are supported:
   request is made with ``fetch()`` from that page, so it goes out with the
   browser's own handshake and cookies.
 
+Apart from challenges, a site's own Turnstile widget can be made to issue a
+token for a request the site guards with one; see
+:meth:`BrowserSolver.turnstile_token`.
+
 What a page can see of this browser was measured against the same Chrome run
 headed, and only the differences found are covered, by launch options rather
 than script: patching navigator properties from JavaScript leaves its own
@@ -39,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import importlib
 import json
 import logging
@@ -129,6 +134,15 @@ async ({url, method, headers, body, referrer}) => {
   return {status: response.status, url: response.url, headers: out, text: await response.text()};
 }
 """
+
+# A page holding nothing but a site's Turnstile widget, answered in place of
+# the site's own. The empty icon keeps the browser from asking the site for one.
+_TURNSTILE_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Turnstile</title>
+<link rel="icon" href="data:,">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head>
+<body><div class="cf-turnstile" data-sitekey="{sitekey}"></div></body></html>"""
+# The widget writes its token into a hidden input beside itself.
+_TURNSTILE_TOKEN_SCRIPT = "() => (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value || ''"
 
 
 class BrowserUnavailable(RuntimeError):
@@ -573,6 +587,66 @@ class BrowserSolver:
                 elapsed=time.monotonic() - started,
                 solved=solved,
             )
+
+    async def turnstile_token(
+        self,
+        url: str,
+        sitekey: str,
+        options: BrowserOptions,
+        proxy: str | None = None,
+    ) -> tuple[str, str]:
+        """Have a site's own Turnstile widget issue a token.
+
+        Unlike a managed challenge, a widget a site embeds (New-API puts one in
+        front of its check-in) hands the page a token, which the site verifies
+        with Cloudflare when it arrives with the guarded request. Turnstile
+        checks no more of the page than its hostname, so ``url`` is answered
+        here with a page holding only the widget and the site is never
+        contacted. A checkbox the widget asks for is ticked.
+
+        Args:
+            url: A page of the site the widget belongs to.
+            sitekey: The widget's public site key.
+            proxy: The proxy the guarded request goes out through.
+
+        Returns:
+            Tuple of the token, empty when none came within ``options.timeout``,
+            and the browser that went out, e.g. "Chrome 153".
+
+        Raises:
+            BrowserUnavailable: Playwright or a browser is missing.
+            Exception: Anything else the browser raised; the caller reports it.
+        """
+        async with self._lock:
+            await self._ensure(options)
+            try:
+                context = await self._browser.new_context(
+                    user_agent=self._user_agent or None,
+                    no_viewport=True,
+                    proxy=_proxy_settings(proxy),
+                )
+                try:
+                    page = await context.new_page()
+                    body = _TURNSTILE_PAGE.replace("{sitekey}", html.escape(sitekey, quote=True))
+                    await page.route(
+                        lambda requested: _same_page(requested, url),
+                        lambda route: route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body),
+                    )
+                    deadline = time.monotonic() + options.timeout
+                    await page.goto(url, wait_until="commit", timeout=options.timeout * 1000)
+                    token, next_look = "", 0.0
+                    while not token and time.monotonic() < deadline:
+                        await asyncio.sleep(_POLL_SECONDS)
+                        token = str(await page.evaluate(_TURNSTILE_TOKEN_SCRIPT) or "")
+                        if not token and time.monotonic() >= next_look:
+                            pressed = await _press_checkbox(page)
+                            next_look = time.monotonic() + (_PRESS_RETRY_SECONDS if pressed else _LOOK_SECONDS)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await context.close()
+            finally:
+                self._arm_idle_close()
+            return token, self._label
 
     # ------------------------------------------------------------------
     # Lifecycle

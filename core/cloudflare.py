@@ -2,12 +2,14 @@
 
 A challenged request is re-issued directly from a headless browser that
 solves the challenge (see :mod:`core.browser`), when Playwright is installed
-and the option is on.
+and the option is on. The same browser gets the token a site's own Turnstile
+widget guards a request with.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -289,6 +291,71 @@ class CloudflareContext:
             record, step, request.method, request.url, status=status, message=message
         )
         return None, message
+
+    async def turnstile_token(
+        self,
+        page_url: str,
+        sitekey: str,
+        proxy: str | None = None,
+        record: Recorder | None = None,
+    ) -> tuple[str, str]:
+        """Have the headless browser get a token from a site's Turnstile widget.
+
+        Follows the same setting as challenge handling: it is the same browser
+        doing Cloudflare's verification.
+
+        Args:
+            page_url: A page of the site the widget belongs to.
+            sitekey: The widget's public site key.
+            proxy: The proxy the guarded request goes out through.
+            record: Optional callback for the browser's trace.
+
+        Returns:
+            Tuple of ``(token, error)``; the error says why there is no token.
+        """
+        step = "Turnstile 无头浏览器"
+        if not self.options.browser_fallback:
+            return "", "无头浏览器验证已在全局设置中关闭"
+        if self._browser is None:
+            return "", "无头浏览器不可用：未配置浏览器"
+        if self._browser_unavailable:
+            return "", self._browser_unavailable
+        started = time.monotonic()
+        try:
+            token, browser = await self._browser.turnstile_token(
+                page_url, sitekey, self.options.browser, proxy
+            )
+        except BrowserUnavailable as exc:
+            self._browser_unavailable = f"无头浏览器不可用：{exc}"
+            _record(record, step, "GET", page_url, message=self._browser_unavailable)
+            logger.warning("Cloudflare browser unavailable: %s", exc)
+            return "", self._browser_unavailable
+        except Exception as exc:
+            message = f"无头浏览器请求异常：{exc}"
+            _record(record, step, "GET", page_url, message=message, error=str(exc))
+            logger.warning(
+                "Turnstile browser failed on %s: %s",
+                _host(page_url),
+                exc,
+                exc_info=True,
+            )
+            return "", message
+        if not token:
+            message = f"{browser} 在 {self.options.browser_timeout:g} 秒内未取得 Turnstile token"
+            _record(record, step, "GET", page_url, message=message)
+            return "", message
+        took = time.monotonic() - started
+        # The page is answered by the browser itself, so there is no status.
+        _record(
+            record,
+            step,
+            "GET",
+            page_url,
+            success=True,
+            message=f"{browser} 取得 Turnstile token，用时 {took:.1f} 秒",
+        )
+        logger.info("Turnstile issued a token for %s in %s", _host(page_url), browser)
+        return token, ""
 
 
 def _record(
