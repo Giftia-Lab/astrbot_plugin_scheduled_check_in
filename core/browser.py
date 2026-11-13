@@ -285,9 +285,16 @@ def _origin(url: str) -> str:
 
 
 def _same_page(first: str, second: str) -> bool:
-    """Whether two URLs name the same page, ignoring the query the challenge adds."""
+    """Whether two URLs name the same page, ignoring the query the challenge adds.
+
+    A port that is its scheme's default counts as left out, which is how the
+    browser reports a URL that spelled it out.
+    """
     a, b = urlsplit(first), urlsplit(second)
-    return (a.scheme, a.netloc.lower(), a.path or "/") == (b.scheme, b.netloc.lower(), b.path or "/")
+    defaults = {"http": 80, "https": 443}
+    return (a.scheme, a.hostname, a.port or defaults.get(a.scheme), a.path or "/") == (
+        b.scheme, b.hostname, b.port or defaults.get(b.scheme), b.path or "/"
+    )
 
 
 def _header(headers: dict[str, str], name: str) -> str:

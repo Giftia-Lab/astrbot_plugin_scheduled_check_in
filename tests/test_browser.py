@@ -22,6 +22,7 @@ from core.browser import (
     BrowserUnavailable,
     _cookie_specs,
     _proxy_settings,
+    _same_page,
     _site_cookies,
     _zone,
     normalize_channel,
@@ -191,6 +192,14 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(_proxy_settings(None), {"server": "http://env:3128"})
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(_proxy_settings(""))
+
+    def test_a_default_port_spelled_out_names_the_same_page(self) -> None:
+        # The browser reports https://host:443/x as https://host/x.
+        self.assertTrue(_same_page("https://relay.example.com/console?x=1", "https://Relay.example.com:443/console"))
+        self.assertTrue(_same_page("http://relay.example.com:80", "http://relay.example.com/"))
+        self.assertFalse(_same_page("https://relay.example.com/console", "https://relay.example.com:8443/console"))
+        self.assertFalse(_same_page("https://relay.example.com/console", "http://relay.example.com:443/console"))
+        self.assertFalse(_same_page("https://relay.example.com/console", "https://relay.example.com/other"))
 
     def test_channel_and_timeout_are_validated(self) -> None:
         self.assertEqual(normalize_channel("Chrome"), "chrome")
@@ -594,7 +603,7 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
             (context(FakeBrowser()), no_key, "未提供 turnstile_site_key", False),
             (context(FakeBrowser(), browser_fallback=False), None, "无头浏览器验证已在全局设置中关闭", True),
             (context(None), None, "无头浏览器不可用：未配置浏览器", True),
-            (None, None, "未配置浏览器", False),
+            (None, None, "无头浏览器不可用：未配置浏览器", True),
             (context(timed_out, browser_timeout=30), None, "Chrome 153 在 30 秒内未取得 Turnstile token", True),
             (context(crashed), None, "无头浏览器请求异常：net::ERR_TIMED_OUT", True),
             (context(missing), None, "无头浏览器不可用：未安装 Playwright", True),
@@ -626,6 +635,20 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
                 ["无头浏览器不可用：未安装 Playwright"],
             )
         self.assertEqual(len(missing.widgets), 1)
+
+    async def test_the_token_joins_the_query_of_a_configured_url(self) -> None:
+        """Ahead of a fragment, which is never sent, and after a query already there."""
+        configured = f"{self.CHECKIN}?source=web#today"
+        with_token = f"{self.CHECKIN}?source=web&{TOKEN_QUERY}#today"
+        session = self._session()
+        session.routes[("POST", configured)] = FakeResponse(200, self.REFUSED)
+        session.routes[("POST", with_token)] = FakeResponse(200, '{"success":true,"message":"签到成功"}')
+        site = self._site(checkin={"path": configured, "protocol": "post"})
+        result = await create_adapter(site, session, None, context(FakeBrowser())).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(
+            [call["url"] for call in session.calls if "/checkin" in call["url"]], [configured, with_token]
+        )
 
     async def test_the_token_request_still_carries_a_proof_of_work(self) -> None:
         browser, session = FakeBrowser(), self._session()

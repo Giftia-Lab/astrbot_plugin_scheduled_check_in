@@ -1517,8 +1517,12 @@ class NewApiAdapter(BaseCheckInAdapter):
             without blaming the credential.
         """
         blame = "站点签到要求 Turnstile 验证，并非凭据失效；"
+        # The page the station's own widget is on.
+        page_url = f"{self.base_url}/console/personal"
         if self.cloudflare is None:
-            return "", f"{blame}无头浏览器不可用：未配置浏览器"
+            error = "无头浏览器不可用：未配置浏览器"
+            self._record_step("Turnstile 无头浏览器", "GET", page_url, message=error)
+            return "", f"{blame}{error}"
         response = await self._traced_request(
             "GET", f"{self.base_url}/api/status", self._base_headers(), "获取 Turnstile 站点密钥"
         )
@@ -1527,9 +1531,8 @@ class NewApiAdapter(BaseCheckInAdapter):
         sitekey = str(data.get("turnstile_site_key") or "").strip() if isinstance(data, dict) else ""
         if not sitekey:
             return "", f"{blame}{error or '站点 /api/status 未提供 turnstile_site_key'}"
-        # The page the station's own widget is on.
         token, error = await self.cloudflare.turnstile_token(
-            f"{self.base_url}/console/personal",
+            page_url,
             sitekey,
             self.proxy,
             self._record_step,
@@ -1577,9 +1580,11 @@ class NewApiAdapter(BaseCheckInAdapter):
                     return False, error, False
                 query = urlencode({"turnstile": token})
                 self._url_secrets.update((token, query.partition("=")[2]))
+                # Into the query proper: after a fragment it would never be sent.
+                parts = urlsplit(url)
                 response, auth = await self._request_with_pow(
                     method,
-                    f"{url}{'&' if '?' in url else '?'}{query}",
+                    urlunsplit(parts._replace(query=f"{parts.query}&{query}" if parts.query else query)),
                     auth,
                     self.checkin,
                     POW_PURPOSE_CHECKIN,
