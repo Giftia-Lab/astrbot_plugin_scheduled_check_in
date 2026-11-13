@@ -8,6 +8,7 @@ import types
 import unittest
 from typing import Any
 from unittest import mock
+from urllib.parse import urlencode
 
 import tests  # noqa: F401
 from core import browser as browser_module
@@ -41,6 +42,9 @@ CHALLENGE_BODY = (
     "<script>window._cf_chl_opt = {cType: 'managed'};</script></body></html>"
 )
 CLEARANCE = [{"name": "cf_clearance", "value": "cl", "domain": ".linux.do", "path": "/"}]
+# A Turnstile token unlike anything else in a trace, with characters a URL has to encode.
+TOKEN = "0.SeCrEt/widget+token"
+TOKEN_QUERY = urlencode({"turnstile": TOKEN})
 
 
 def challenge() -> FakeResponse:
@@ -54,7 +58,7 @@ class FakeBrowser:
         self.answers = list(answers)
         self.calls: list[tuple[BrowserRequest, BrowserOptions, list]] = []
         # What the Turnstile widget hands out, and the widgets asked for one.
-        self.token: Any = "tok"
+        self.token: Any = TOKEN
         self.widgets: list[tuple[str, str, str | None]] = []
 
     async def request(self, request: BrowserRequest, options: BrowserOptions, clearance: Any = ()) -> BrowserOutcome:
@@ -476,7 +480,7 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
             ("GET", f"{BASE}/api/status"): status or FakeResponse(
                 200, '{"success":true,"data":{"turnstile_check":true,"turnstile_site_key":"0xKEY"}}'
             ),
-            ("POST", f"{self.CHECKIN}?turnstile=tok"): with_token or FakeResponse(
+            ("POST", f"{self.CHECKIN}?{TOKEN_QUERY}"): with_token or FakeResponse(
                 200, '{"success":true,"message":"签到成功"}'
             ),
         })
@@ -497,14 +501,38 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser.widgets, [(f"{BASE}/console/personal", "0xKEY", "http://p:1")])
         self.assertEqual(
             [call["url"] for call in session.calls if "/checkin" in call["url"]],
-            [self.CHECKIN, f"{self.CHECKIN}?turnstile=tok"],
+            [self.CHECKIN, f"{self.CHECKIN}?{TOKEN_QUERY}"],
         )
         steps = [attempt["step"] for attempt in result.attempts]
         self.assertEqual(steps[1:5], [
             "签到", "获取 Turnstile 站点密钥", "Turnstile 无头浏览器", "签到（携带 Turnstile token）",
         ])
-        # The token stays out of the trace.
-        self.assertNotIn("turnstile=tok", json.dumps(result.attempts))
+        self._assert_token_is_nowhere(result)
+
+    def _assert_token_is_nowhere(self, result: Any) -> None:
+        """The token is in no form in anything a run stores or shows."""
+        stored = json.dumps(result.to_dict(), ensure_ascii=False)
+        for secret in (TOKEN, TOKEN_QUERY.partition("=")[2]):
+            self.assertNotIn(secret, stored)
+
+    async def test_an_error_that_quotes_the_url_does_not_leak_the_token(self) -> None:
+        """Transport and browser errors name the URL they failed on."""
+        quoted = f"Failed to connect to {self.CHECKIN}?{TOKEN_QUERY} (sent {TOKEN})"
+        failures = {
+            "transport": (RuntimeError(quoted), FakeBrowser()),
+            # Challenged, then the browser fails on the same URL.
+            "browser": (challenge(), FakeBrowser(RuntimeError(quoted))),
+        }
+        for name, (with_token, browser) in failures.items():
+            with self.subTest(failure=name):
+                session = self._session(with_token=with_token)
+                result = await create_adapter(self._site(), session, None, context(browser)).check_in()
+                self.assertFalse(result.success)
+                self.assertFalse(result.expired)
+                self.assertIn("Failed to connect to", result.message)
+                self.assertIn("turnstile=***", result.message)
+                self.assertIn("turnstile=***", result.error_detail)
+                self._assert_token_is_nowhere(result)
 
     async def test_a_check_in_that_is_not_refused_never_starts_the_browser(self) -> None:
         browser, session = FakeBrowser(), self._session()
@@ -530,14 +558,15 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
         crashed.token = RuntimeError("net::ERR_TIMED_OUT")
         missing.token = BrowserUnavailable("未安装 Playwright")
         cases = [
-            (context(FakeBrowser()), no_key, "未提供 turnstile_site_key"),
-            (context(FakeBrowser(), browser_fallback=False), None, "无头浏览器验证已在全局设置中关闭"),
-            (None, None, "未配置浏览器"),
-            (context(timed_out, browser_timeout=30), None, "Chrome 153 在 30 秒内未取得 Turnstile token"),
-            (context(crashed), None, "无头浏览器请求异常：net::ERR_TIMED_OUT"),
-            (context(missing), None, "无头浏览器不可用：未安装 Playwright"),
+            (context(FakeBrowser()), no_key, "未提供 turnstile_site_key", False),
+            (context(FakeBrowser(), browser_fallback=False), None, "无头浏览器验证已在全局设置中关闭", True),
+            (context(None), None, "无头浏览器不可用：未配置浏览器", True),
+            (None, None, "未配置浏览器", False),
+            (context(timed_out, browser_timeout=30), None, "Chrome 153 在 30 秒内未取得 Turnstile token", True),
+            (context(crashed), None, "无头浏览器请求异常：net::ERR_TIMED_OUT", True),
+            (context(missing), None, "无头浏览器不可用：未安装 Playwright", True),
         ]
-        for cloudflare, status, expected in cases:
+        for cloudflare, status, expected, traced in cases:
             with self.subTest(expected=expected):
                 session = self._session(status=status)
                 result = await create_adapter(self._site(), session, None, cloudflare).check_in()
@@ -545,7 +574,25 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result.expired)
                 self.assertIn("站点签到要求 Turnstile 验证，并非凭据失效", result.message)
                 self.assertIn(expected, result.message)
-                self.assertEqual(session.count_to("/api/user/checkin"), 1)
+                # Sent once, and not again under any query string.
+                self.assertEqual(
+                    [call["url"] for call in session.calls if "/checkin" in call["url"]], [self.CHECKIN]
+                )
+                # The browser's own step says why, wherever it got that far.
+                browser_steps = [a for a in result.attempts if a["step"] == "Turnstile 无头浏览器"]
+                self.assertEqual([a["message"] for a in browser_steps], [expected] if traced else [])
+
+    async def test_a_browser_found_missing_is_traced_on_every_later_site(self) -> None:
+        missing = FakeBrowser()
+        missing.token = BrowserUnavailable("未安装 Playwright")
+        cloudflare = context(missing)
+        for _ in range(2):
+            result = await create_adapter(self._site(), self._session(), None, cloudflare).check_in()
+            self.assertEqual(
+                [a["message"] for a in result.attempts if a["step"] == "Turnstile 无头浏览器"],
+                ["无头浏览器不可用：未安装 Playwright"],
+            )
+        self.assertEqual(len(missing.widgets), 1)
 
     async def test_the_token_request_still_carries_a_proof_of_work(self) -> None:
         browser, session = FakeBrowser(), self._session()

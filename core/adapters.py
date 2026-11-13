@@ -308,6 +308,10 @@ class BaseCheckInAdapter(ABC):
         # Whether the latest OAuth login failed for a reason unrelated to its
         # credential, such as a refused proof of work.
         self._login_inconclusive = False
+        # Secrets this run sent in a URL, as typed and as encoded there. A
+        # transport or browser error may quote the URL it failed on, so they
+        # are blanked in the trace and in the result's message.
+        self._url_secrets: set[str] = set()
 
     # ------------------------------------------------------------------
     # Request tracing
@@ -389,6 +393,10 @@ class BaseCheckInAdapter(ABC):
         error: str = "",
     ) -> None:
         """Append one request trace while deliberately excluding request headers."""
+        for secret in self._url_secrets:
+            message, error, response_text = (
+                str(text or "").replace(secret, "***") for text in (message, error, response_text)
+            )
         attempts = self.attempts
         item: dict[str, Any] = {
             "step": step,
@@ -1479,6 +1487,8 @@ class BaseCheckInAdapter(ABC):
                 a successful check-in is otherwise unexplained.
         """
         include_detail = not success or detail_on_success
+        for secret in self._url_secrets:
+            message = message.replace(secret, "***")
         return CheckInResult(
             site_id=self.site_id,
             site_name=self.site_name,
@@ -1560,9 +1570,11 @@ class NewApiAdapter(BaseCheckInAdapter):
                 token, error = await self._turnstile_token()
                 if error:
                     return False, error, False
+                query = urlencode({"turnstile": token})
+                self._url_secrets.update((token, query.partition("=")[2]))
                 response, auth = await self._request_with_pow(
                     method,
-                    f"{url}{'&' if '?' in url else '?'}{urlencode({'turnstile': token})}",
+                    f"{url}{'&' if '?' in url else '?'}{query}",
                     auth,
                     self.checkin,
                     POW_PURPOSE_CHECKIN,

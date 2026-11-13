@@ -314,12 +314,18 @@ class CloudflareContext:
             Tuple of ``(token, error)``; the error says why there is no token.
         """
         step = "Turnstile 无头浏览器"
+        unavailable = ""
         if not self.options.browser_fallback:
-            return "", "无头浏览器验证已在全局设置中关闭"
-        if self._browser is None:
-            return "", "无头浏览器不可用：未配置浏览器"
-        if self._browser_unavailable:
-            return "", self._browser_unavailable
+            unavailable = "无头浏览器验证已在全局设置中关闭"
+        elif self._browser is None:
+            unavailable = "无头浏览器不可用：未配置浏览器"
+        elif self._browser_unavailable:
+            unavailable = self._browser_unavailable
+        if unavailable:
+            # Recorded, unlike a challenge left standing: there is no response
+            # here whose own trace entry would carry the reason.
+            _record(record, step, "GET", page_url, message=unavailable)
+            return "", unavailable
         started = time.monotonic()
         try:
             token, browser = await self._browser.turnstile_token(
