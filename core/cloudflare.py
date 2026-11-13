@@ -257,8 +257,14 @@ class CloudflareContext:
                 message=message,
                 error=str(exc),
             )
+            # The browser quotes the URL it failed on, and a query may carry
+            # a secret (a Turnstile token); so may the traceback's last line.
+            bare = request.url.partition("?")[0]
             logger.warning(
-                "Cloudflare browser failed on %s: %s", host, exc, exc_info=True
+                "Cloudflare browser failed on %s: %s",
+                host,
+                str(exc).replace(request.url, bare),
+                exc_info=bare == request.url,
             )
             return None, message
 
@@ -298,6 +304,7 @@ class CloudflareContext:
         sitekey: str,
         proxy: str | None = None,
         record: Recorder | None = None,
+        verify: bool = True,
     ) -> tuple[str, str]:
         """Have the headless browser get a token from a site's Turnstile widget.
 
@@ -309,6 +316,8 @@ class CloudflareContext:
             sitekey: The widget's public site key.
             proxy: The proxy the guarded request goes out through.
             record: Optional callback for the browser's trace.
+            verify: Whether the browser checks TLS certificates, as the
+                guarded request does.
 
         Returns:
             Tuple of ``(token, error)``; the error says why there is no token.
@@ -329,7 +338,7 @@ class CloudflareContext:
         started = time.monotonic()
         try:
             token, browser = await self._browser.turnstile_token(
-                page_url, sitekey, self.options.browser, proxy
+                page_url, sitekey, self.options.browser, proxy, verify
             )
         except BrowserUnavailable as exc:
             self._browser_unavailable = f"无头浏览器不可用：{exc}"

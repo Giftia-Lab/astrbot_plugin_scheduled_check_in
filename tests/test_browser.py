@@ -60,6 +60,8 @@ class FakeBrowser:
         # What the Turnstile widget hands out, and the widgets asked for one.
         self.token: Any = TOKEN
         self.widgets: list[tuple[str, str, str | None]] = []
+        # Whether each of those was to check TLS certificates.
+        self.verified: list[bool] = []
 
     async def request(self, request: BrowserRequest, options: BrowserOptions, clearance: Any = ()) -> BrowserOutcome:
         self.calls.append((request, options, list(clearance)))
@@ -69,9 +71,10 @@ class FakeBrowser:
         return BrowserOutcome(answer, CLEARANCE, "Chrome 153", 4.2, solved=True)
 
     async def turnstile_token(
-        self, url: str, sitekey: str, options: BrowserOptions, proxy: str | None = None
+        self, url: str, sitekey: str, options: BrowserOptions, proxy: str | None = None, verify: bool = True
     ) -> tuple[str, str]:
         self.widgets.append((url, sitekey, proxy))
+        self.verified.append(verify)
         if isinstance(self.token, Exception):
             raise self.token
         return self.token, "Chrome 153"
@@ -371,6 +374,15 @@ class ResolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无头浏览器请求异常：net::ERR_TIMED_OUT", resolution.detail)
         self.assertEqual(trace.browser_entries()[0]["error"], "net::ERR_TIMED_OUT")
 
+    async def test_a_browser_error_is_logged_without_the_query_of_its_url(self) -> None:
+        url = f"{BASE}/api/user/checkin"
+        browser = FakeBrowser(RuntimeError(f"Page.goto: net::ERR_FAILED at {url}?{TOKEN_QUERY}"))
+        with self.assertLogs("astrbot", level="WARNING") as logs:
+            await resolve(context(browser), request=BrowserRequest("POST", f"{url}?{TOKEN_QUERY}"))
+        logged = "\n".join(logs.output)
+        self.assertIn(f"net::ERR_FAILED at {url}", logged)
+        self.assertNotIn(TOKEN_QUERY.partition("=")[2], logged)
+
 
 # ----------------------------------------------------------------------
 # OAuth and adapters
@@ -533,6 +545,27 @@ class TurnstileCheckInTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("turnstile=***", result.message)
                 self.assertIn("turnstile=***", result.error_detail)
                 self._assert_token_is_nowhere(result)
+
+    async def test_a_challenged_token_request_is_logged_without_its_token(self) -> None:
+        """The acw_sc__v2 handling logs the URL it was challenged on."""
+        acw = FakeResponse(200, f"<html><script>var arg1='{'0a' * 20}'; document.cookie='acw_sc__v2=';</script></html>")
+        session = self._session(with_token=acw)
+        with self.assertLogs("astrbot", level="INFO") as logs:
+            result = await create_adapter(self._site(), session, None, context(FakeBrowser())).check_in()
+        self.assertFalse(result.success)
+        logged = "\n".join(logs.output)
+        self.assertIn(f"acw_sc__v2 challenge from {self.CHECKIN}:", logged)
+        for secret in (TOKEN, TOKEN_QUERY.partition("=")[2]):
+            self.assertNotIn(secret, logged)
+        self._assert_token_is_nowhere(result)
+
+    async def test_the_browser_checks_certificates_as_the_session_does(self) -> None:
+        for verify in (True, False):
+            with self.subTest(verify=verify):
+                browser, session = FakeBrowser(), self._session()
+                session.verify = verify
+                await create_adapter(self._site(), session, None, context(browser)).check_in()
+                self.assertEqual(browser.verified, [verify])
 
     async def test_a_check_in_that_is_not_refused_never_starts_the_browser(self) -> None:
         browser, session = FakeBrowser(), self._session()

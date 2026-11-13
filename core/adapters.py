@@ -910,7 +910,8 @@ class BaseCheckInAdapter(ABC):
         try:
             solution = self._acw_solver.solve(text)
         except AcwScV2Error as exc:
-            logger.warning("Failed to solve acw_sc__v2 challenge from %s: %s", url, exc)
+            # Without its query, which may carry a secret (a Turnstile token).
+            logger.warning("Failed to solve acw_sc__v2 challenge from %s: %s", self._safe_url(url), exc)
             return _TextResponse(status=status, text=text, challenge_error=str(exc))
 
         self._challenge_cookies.update(response_cookies)
@@ -918,7 +919,7 @@ class BaseCheckInAdapter(ABC):
         retry_headers = self._merge_challenge_cookies(headers)
         logger.info(
             "Solved acw_sc__v2 challenge from %s with algorithm %s (%s)",
-            url,
+            self._safe_url(url),
             solution.algorithm_fingerprint[:12],
             "cache hit" if solution.cache_hit else "translated",
         )
@@ -1528,7 +1529,11 @@ class NewApiAdapter(BaseCheckInAdapter):
             return "", f"{blame}{error or '站点 /api/status 未提供 turnstile_site_key'}"
         # The page the station's own widget is on.
         token, error = await self.cloudflare.turnstile_token(
-            f"{self.base_url}/console/personal", sitekey, self.proxy, self._record_step
+            f"{self.base_url}/console/personal",
+            sitekey,
+            self.proxy,
+            self._record_step,
+            verify=getattr(self.session, "verify", True) is not False,
         )
         return token, f"{blame}{error}" if error else ""
 

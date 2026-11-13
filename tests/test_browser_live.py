@@ -8,8 +8,10 @@ it says nothing about whether Cloudflare's own challenge passes.
 
 from __future__ import annotations
 
-import unittest
+import asyncio
 import tempfile
+import time
+import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -430,6 +432,20 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
                 f"{self.base}/console/personal", "0xKEY", BrowserOptions(timeout=2)
             )
         self.assertEqual(token, "")
+
+    async def test_a_browser_command_that_stalls_ends_with_the_timeout(self) -> None:
+        async def never(page: object) -> bool:
+            await asyncio.Event().wait()
+            return False
+
+        started = time.monotonic()
+        with mock.patch.object(browser_module, "_TURNSTILE_PAGE", "<html><body>no widget</body></html>"), \
+                mock.patch.object(browser_module, "_press_checkbox", never):
+            token, _ = await self.solver.turnstile_token(
+                f"{self.base}/console/personal", "0xKEY", BrowserOptions(timeout=2)
+            )
+        self.assertEqual(token, "")
+        self.assertLess(time.monotonic() - started, 10)
 
     async def test_the_window_looks_like_a_desktop_window(self) -> None:
         outcome = await self.solver.request(BrowserRequest("GET", f"{self.base}/geometry"), self.options)

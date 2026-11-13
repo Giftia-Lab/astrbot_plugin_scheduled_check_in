@@ -594,6 +594,7 @@ class BrowserSolver:
         sitekey: str,
         options: BrowserOptions,
         proxy: str | None = None,
+        verify: bool = True,
     ) -> tuple[str, str]:
         """Have a site's own Turnstile widget issue a token.
 
@@ -608,6 +609,9 @@ class BrowserSolver:
             url: A page of the site the widget belongs to.
             sitekey: The widget's public site key.
             proxy: The proxy the guarded request goes out through.
+            verify: Whether TLS certificates are checked. The widget's script
+                comes over the same connection the guarded request uses, which
+                an intercepting proxy may re-sign.
 
         Returns:
             Tuple of the token, empty when none came within ``options.timeout``,
@@ -624,6 +628,7 @@ class BrowserSolver:
                     user_agent=self._user_agent or None,
                     no_viewport=True,
                     proxy=_proxy_settings(proxy),
+                    ignore_https_errors=not verify,
                 )
                 try:
                     page = await context.new_page()
@@ -635,12 +640,19 @@ class BrowserSolver:
                     deadline = time.monotonic() + options.timeout
                     await page.goto(url, wait_until="commit", timeout=options.timeout * 1000)
                     token, next_look = "", 0.0
-                    while not token and time.monotonic() < deadline:
-                        await asyncio.sleep(_POLL_SECONDS)
-                        token = str(await page.evaluate(_TURNSTILE_TOKEN_SCRIPT) or "")
-                        if not token and time.monotonic() >= next_look:
-                            pressed = await _press_checkbox(page)
-                            next_look = time.monotonic() + (_PRESS_RETRY_SECONDS if pressed else _LOOK_SECONDS)
+                    # A page that stopped answering must not hold the browser,
+                    # and every request queued behind it, past the deadline.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        while not token and time.monotonic() < deadline:
+                            await asyncio.sleep(_POLL_SECONDS)
+                            token = str(await asyncio.wait_for(
+                                page.evaluate(_TURNSTILE_TOKEN_SCRIPT), max(0.1, deadline - time.monotonic())
+                            ) or "")
+                            if not token and time.monotonic() >= next_look:
+                                pressed = await asyncio.wait_for(
+                                    _press_checkbox(page), max(0.1, deadline - time.monotonic())
+                                )
+                                next_look = time.monotonic() + (_PRESS_RETRY_SECONDS if pressed else _LOOK_SECONDS)
                 finally:
                     with contextlib.suppress(Exception):
                         await context.close()
