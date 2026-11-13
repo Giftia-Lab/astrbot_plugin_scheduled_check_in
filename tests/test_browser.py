@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 import unittest
 from typing import Any
@@ -238,6 +239,21 @@ class UnavailableTests(unittest.IsolatedAsyncioTestCase):
                 await BrowserSolver().request(BrowserRequest("GET", AUTHORIZE), BrowserOptions())
         self.assertIn("pip install playwright", str(caught.exception))
         self.assertIn("一键安装", str(caught.exception))
+
+    async def test_a_failed_navigation_is_logged_without_the_query_of_its_url(self) -> None:
+        url = f"{BASE}/api/user/checkin"
+
+        class Page:
+            async def goto(self, target: str, **_: Any) -> None:
+                raise RuntimeError(f"Page.goto: net::ERR_FAILED at {target}\nCall log:")
+
+        with self.assertLogs("astrbot", level="DEBUG") as logs:
+            error = await BrowserSolver._goto(Page(), f"{url}?{TOKEN_QUERY}", time.monotonic() + 5)
+        # The caller still gets the error as raised; its own trace blanks the token.
+        self.assertEqual(error, f"Page.goto: net::ERR_FAILED at {url}?{TOKEN_QUERY}")
+        logged = "\n".join(logs.output)
+        self.assertIn(f"Browser navigation to {url} ended early: Page.goto: net::ERR_FAILED at {url}\n", logged)
+        self.assertNotIn(TOKEN_QUERY.partition("=")[2], logged)
 
     def test_a_package_installed_later_is_picked_up(self) -> None:
         # The module was imported without Playwright; an install since then

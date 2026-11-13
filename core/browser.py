@@ -809,8 +809,10 @@ class BrowserSolver:
             await page.goto(url, referer=referer or None, wait_until="commit", timeout=timeout)
         except Exception as exc:
             # A navigation the challenge replaced aborts the goto as well; what
-            # the page ends up showing is judged afterwards.
-            logger.debug("Browser navigation to %s ended early: %s", url, exc)
+            # the page ends up showing is judged afterwards. Logged without the
+            # URL's query, which may carry a secret (a Turnstile token).
+            bare = url.partition("?")[0]
+            logger.debug("Browser navigation to %s ended early: %s", bare, str(exc).replace(url, bare))
             return str(exc).splitlines()[0]
         return ""
 
