@@ -18,6 +18,10 @@ Two shapes of request are supported:
   request is made with ``fetch()`` from that page, so it goes out with the
   browser's own handshake and cookies.
 
+Apart from challenges, a site's own Turnstile widget can be made to issue a
+token for a request the site guards with one; see
+:meth:`BrowserSolver.turnstile_token`.
+
 What a page can see of this browser was measured against the same Chrome run
 headed, and only the differences found are covered, by launch options rather
 than script: patching navigator properties from JavaScript leaves its own
@@ -39,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import importlib
 import json
 import logging
@@ -129,6 +134,15 @@ async ({url, method, headers, body, referrer}) => {
   return {status: response.status, url: response.url, headers: out, text: await response.text()};
 }
 """
+
+# A page holding nothing but a site's Turnstile widget, answered in place of
+# the site's own. The empty icon keeps the browser from asking the site for one.
+_TURNSTILE_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Turnstile</title>
+<link rel="icon" href="data:,">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head>
+<body><div class="cf-turnstile" data-sitekey="{sitekey}"></div></body></html>"""
+# The widget writes its token into a hidden input beside itself.
+_TURNSTILE_TOKEN_SCRIPT = "() => (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value || ''"
 
 
 class BrowserUnavailable(RuntimeError):
@@ -271,9 +285,16 @@ def _origin(url: str) -> str:
 
 
 def _same_page(first: str, second: str) -> bool:
-    """Whether two URLs name the same page, ignoring the query the challenge adds."""
+    """Whether two URLs name the same page, ignoring the query the challenge adds.
+
+    A port that is its scheme's default counts as left out, which is how the
+    browser reports a URL that spelled it out.
+    """
     a, b = urlsplit(first), urlsplit(second)
-    return (a.scheme, a.netloc.lower(), a.path or "/") == (b.scheme, b.netloc.lower(), b.path or "/")
+    defaults = {"http": 80, "https": 443}
+    return (a.scheme, a.hostname, a.port or defaults.get(a.scheme), a.path or "/") == (
+        b.scheme, b.hostname, b.port or defaults.get(b.scheme), b.path or "/"
+    )
 
 
 def _header(headers: dict[str, str], name: str) -> str:
@@ -574,6 +595,78 @@ class BrowserSolver:
                 solved=solved,
             )
 
+    async def turnstile_token(
+        self,
+        url: str,
+        sitekey: str,
+        options: BrowserOptions,
+        proxy: str | None = None,
+        verify: bool = True,
+    ) -> tuple[str, str]:
+        """Have a site's own Turnstile widget issue a token.
+
+        Unlike a managed challenge, a widget a site embeds (New-API puts one in
+        front of its check-in) hands the page a token, which the site verifies
+        with Cloudflare when it arrives with the guarded request. Turnstile
+        checks no more of the page than its hostname, so ``url`` is answered
+        here with a page holding only the widget and the site is never
+        contacted. A checkbox the widget asks for is ticked.
+
+        Args:
+            url: A page of the site the widget belongs to.
+            sitekey: The widget's public site key.
+            proxy: The proxy the guarded request goes out through.
+            verify: Whether TLS certificates are checked. The widget's script
+                comes over the same connection the guarded request uses, which
+                an intercepting proxy may re-sign.
+
+        Returns:
+            Tuple of the token, empty when none came within ``options.timeout``,
+            and the browser that went out, e.g. "Chrome 153".
+
+        Raises:
+            BrowserUnavailable: Playwright or a browser is missing.
+            Exception: Anything else the browser raised; the caller reports it.
+        """
+        async with self._lock:
+            await self._ensure(options)
+            try:
+                context = await self._browser.new_context(
+                    user_agent=self._user_agent or None,
+                    no_viewport=True,
+                    proxy=_proxy_settings(proxy),
+                    ignore_https_errors=not verify,
+                )
+                try:
+                    page = await context.new_page()
+                    body = _TURNSTILE_PAGE.replace("{sitekey}", html.escape(sitekey, quote=True))
+                    await page.route(
+                        lambda requested: _same_page(requested, url),
+                        lambda route: route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body),
+                    )
+                    deadline = time.monotonic() + options.timeout
+                    await page.goto(url, wait_until="commit", timeout=options.timeout * 1000)
+                    token, next_look = "", 0.0
+                    # A page that stopped answering must not hold the browser,
+                    # and every request queued behind it, past the deadline.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        while not token and time.monotonic() < deadline:
+                            await asyncio.sleep(_POLL_SECONDS)
+                            token = str(await asyncio.wait_for(
+                                page.evaluate(_TURNSTILE_TOKEN_SCRIPT), max(0.1, deadline - time.monotonic())
+                            ) or "")
+                            if not token and time.monotonic() >= next_look:
+                                pressed = await asyncio.wait_for(
+                                    _press_checkbox(page), max(0.1, deadline - time.monotonic())
+                                )
+                                next_look = time.monotonic() + (_PRESS_RETRY_SECONDS if pressed else _LOOK_SECONDS)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await context.close()
+            finally:
+                self._arm_idle_close()
+            return token, self._label
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -716,8 +809,10 @@ class BrowserSolver:
             await page.goto(url, referer=referer or None, wait_until="commit", timeout=timeout)
         except Exception as exc:
             # A navigation the challenge replaced aborts the goto as well; what
-            # the page ends up showing is judged afterwards.
-            logger.debug("Browser navigation to %s ended early: %s", url, exc)
+            # the page ends up showing is judged afterwards. Logged without the
+            # URL's query, which may carry a secret (a Turnstile token).
+            bare = url.partition("?")[0]
+            logger.debug("Browser navigation to %s ended early: %s", bare, str(exc).replace(url, bare))
             return str(exc).splitlines()[0]
         return ""
 

@@ -408,6 +408,7 @@
               <div class="form-hint">
                 由 Playwright 驱动真实的 Chrome / Edge / Chromium 打开被拦截的地址，通过 Cloudflare 托管质询后在浏览器内完成该请求（OAuth 授权一步在跳回站点前截下授权码）。
                 验证 Cookie 在本轮后续请求中沿用，浏览器空闲 5 分钟后自动关闭。
+                站点签到自带的 Turnstile 验证（New-API 报「Turnstile token 为空」）也由它取得 token，关闭后同样不再处理。
                 <span id="cf-browser-install-hint"></span>
               </div>
             </div>

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from curl_cffi.requests import AsyncSession
 
@@ -308,6 +308,10 @@ class BaseCheckInAdapter(ABC):
         # Whether the latest OAuth login failed for a reason unrelated to its
         # credential, such as a refused proof of work.
         self._login_inconclusive = False
+        # Secrets this run sent in a URL, as typed and as encoded there. A
+        # transport or browser error may quote the URL it failed on, so they
+        # are blanked in the trace and in the result's message.
+        self._url_secrets: set[str] = set()
 
     # ------------------------------------------------------------------
     # Request tracing
@@ -389,6 +393,10 @@ class BaseCheckInAdapter(ABC):
         error: str = "",
     ) -> None:
         """Append one request trace while deliberately excluding request headers."""
+        for secret in self._url_secrets:
+            message, error, response_text = (
+                str(text or "").replace(secret, "***") for text in (message, error, response_text)
+            )
         attempts = self.attempts
         item: dict[str, Any] = {
             "step": step,
@@ -902,7 +910,8 @@ class BaseCheckInAdapter(ABC):
         try:
             solution = self._acw_solver.solve(text)
         except AcwScV2Error as exc:
-            logger.warning("Failed to solve acw_sc__v2 challenge from %s: %s", url, exc)
+            # Without its query, which may carry a secret (a Turnstile token).
+            logger.warning("Failed to solve acw_sc__v2 challenge from %s: %s", self._safe_url(url), exc)
             return _TextResponse(status=status, text=text, challenge_error=str(exc))
 
         self._challenge_cookies.update(response_cookies)
@@ -910,7 +919,7 @@ class BaseCheckInAdapter(ABC):
         retry_headers = self._merge_challenge_cookies(headers)
         logger.info(
             "Solved acw_sc__v2 challenge from %s with algorithm %s (%s)",
-            url,
+            self._safe_url(url),
             solution.algorithm_fingerprint[:12],
             "cache hit" if solution.cache_hit else "translated",
         )
@@ -1479,6 +1488,8 @@ class BaseCheckInAdapter(ABC):
                 a successful check-in is otherwise unexplained.
         """
         include_detail = not success or detail_on_success
+        for secret in self._url_secrets:
+            message = message.replace(secret, "***")
         return CheckInResult(
             site_id=self.site_id,
             site_name=self.site_name,
@@ -1495,6 +1506,40 @@ class BaseCheckInAdapter(ABC):
 class NewApiAdapter(BaseCheckInAdapter):
     """Adapter for New-API / One-API relay station frameworks."""
 
+    async def _turnstile_token(self) -> tuple[str, str]:
+        """Get a token for the Turnstile check a station put on its check-in.
+
+        The station publishes its widget's site key in ``/api/status``, and the
+        headless browser has that widget issue the token.
+
+        Returns:
+            Tuple of ``(token, error)``; the error says why there is no token,
+            without blaming the credential.
+        """
+        blame = "站点签到要求 Turnstile 验证，并非凭据失效；"
+        # The page the station's own widget is on.
+        page_url = f"{self.base_url}/console/personal"
+        if self.cloudflare is None:
+            error = "无头浏览器不可用：未配置浏览器"
+            self._record_step("Turnstile 无头浏览器", "GET", page_url, message=error)
+            return "", f"{blame}{error}"
+        response = await self._traced_request(
+            "GET", f"{self.base_url}/api/status", self._base_headers(), "获取 Turnstile 站点密钥"
+        )
+        payload, error = self._parse_json(response)
+        data = payload.get("data") if payload is not None else None
+        sitekey = str(data.get("turnstile_site_key") or "").strip() if isinstance(data, dict) else ""
+        if not sitekey:
+            return "", f"{blame}{error or '站点 /api/status 未提供 turnstile_site_key'}"
+        token, error = await self.cloudflare.turnstile_token(
+            page_url,
+            sitekey,
+            self.proxy,
+            self._record_step,
+            verify=getattr(self.session, "verify", True) is not False,
+        )
+        return token, f"{blame}{error}" if error else ""
+
     async def _attempt_checkin(
         self,
         auth: _AuthContext,
@@ -1510,6 +1555,10 @@ class NewApiAdapter(BaseCheckInAdapter):
         ``checkin`` challenge; a refused one is retried on a new challenge the
         way the station's own client does.
 
+        A station with New-API's Turnstile check on refuses the request for
+        want of a token; one is then obtained from the station's widget and the
+        request sent again with it, in the query string where New-API reads it.
+
         Returns:
             Tuple of ``(success, message, expired)``.
         """
@@ -1519,6 +1568,28 @@ class NewApiAdapter(BaseCheckInAdapter):
             response, auth = await self._request_with_pow(
                 method, url, auth, self.checkin, POW_PURPOSE_CHECKIN, "签到"
             )
+            refusal, _ = self._parse_json(response)
+            if (
+                auth.ok
+                and refusal is not None
+                and refusal.get("success") is not True
+                and "turnstile" in str(refusal.get("message") or "").lower()
+            ):
+                token, error = await self._turnstile_token()
+                if error:
+                    return False, error, False
+                query = urlencode({"turnstile": token})
+                self._url_secrets.update((token, query.partition("=")[2]))
+                # Into the query proper: after a fragment it would never be sent.
+                parts = urlsplit(url)
+                response, auth = await self._request_with_pow(
+                    method,
+                    urlunsplit(parts._replace(query=f"{parts.query}&{query}" if parts.query else query)),
+                    auth,
+                    self.checkin,
+                    POW_PURPOSE_CHECKIN,
+                    "签到（携带 Turnstile token）",
+                )
         except Exception as exc:
             return False, f"请求异常: {exc}", False
         if not auth.ok:
